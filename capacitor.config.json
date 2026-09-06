@@ -1,0 +1,8 @@
+{
+  "appId": "com.local.songbookviewer",
+  "appName": "Songbook Viewer",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  }
+}

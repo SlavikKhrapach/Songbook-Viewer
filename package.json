@@ -1,0 +1,53 @@
+{
+  "name": "songbook-viewer",
+  "version": "2.0.0",
+  "description": "A fast, Apple Books-style songbook and PDF viewer for Windows",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "mobile:assets": "node scripts/build-www.js",
+    "mobile:sync": "node scripts/build-www.js && cap sync android",
+    "mobile:open": "node scripts/build-www.js && cap sync android && cap open android"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "@capacitor-community/keep-awake": "^5.0.1",
+    "@capacitor/android": "^6.2.1",
+    "@capacitor/cli": "^6.2.1",
+    "@capacitor/core": "^6.2.1",
+    "@capacitor/filesystem": "^6.0.4",
+    "@capacitor/preferences": "^6.0.4",
+    "@capacitor/share": "^6.0.3",
+    "pdfjs-dist": "^4.4.168"
+  },
+  "build": {
+    "appId": "com.local.songbookviewer",
+    "productName": "Songbook Viewer",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "build/icon.ico",
+      "node_modules/pdfjs-dist/build/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Songbook Viewer"
+    }
+  }
+}

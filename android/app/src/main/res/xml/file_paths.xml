@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Cache dir: used for sharing files via FileProvider -->
+    <cache-path name="my_cache_images" path="." />
+    <!-- External files dir: fallback for sharing on older APIs -->
+    <external-path name="my_images" path="." />
+    <!-- Documents dir: needed by FileProvider to share from Documents on Android 10+ -->
+    <external-files-path name="documents" path="." />
+</paths>

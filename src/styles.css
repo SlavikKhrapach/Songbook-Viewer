@@ -1,0 +1,1396 @@
+:root {
+  --bg: #ffffff;
+  --bg-elevated: #f2f2f2;
+  --toolbar-bg: rgba(255, 255, 255, 0.9);
+  --border: #d8d8d8;
+  --text: #1a1a1a;
+  --text-dim: #6a6a6a;
+  --accent: #0a84ff;
+  --page-shadow: rgba(0, 0, 0, 0.15);
+  --btn-bg: #f2f2f2;
+  --btn-hover: #e6e6e6;
+  --btn-active: #dcdcdc;
+  --btn-border-hover: #c4c4c4;
+  --track-bg: #cfcfcf;
+  --result-hover: #eef4ff;
+  --input-bg: #ffffff;
+}
+
+/* Dark theme: dark chrome + inverted PDF pages (black paper, white ink). */
+body.dark {
+  --bg: #121212;
+  --bg-elevated: #1f1f1f;
+  --toolbar-bg: rgba(24, 24, 24, 0.92);
+  --border: #383838;
+  --text: #e8e8e8;
+  --text-dim: #9a9a9a;
+  --accent: #4c9dff;
+  --page-shadow: rgba(0, 0, 0, 0.6);
+  --btn-bg: #2a2a2a;
+  --btn-hover: #363636;
+  --btn-active: #2f2f2f;
+  --btn-border-hover: #4a4a4a;
+  --track-bg: #3a3a3a;
+  --result-hover: #23324a;
+  --input-bg: #1a1a1a;
+}
+/* Invert the rendered pages so black ink on white becomes white on black.
+   The annotation overlay gets the same transform so a black marker shows as
+   white in dark mode, while colored markers keep roughly their true color. */
+body.dark .page-canvas,
+body.dark .anno-canvas {
+  filter: invert(1) hue-rotate(180deg);
+}
+/* Match the toolbar color swatches to how the ink actually appears on the
+   inverted page in dark mode (so "black" previews as white, etc.).
+   Invert only the fill via a background transform, leaving the selection
+   ring (border/box-shadow) untouched. */
+body.dark .swatch {
+  background: var(--sw);
+  filter: invert(1) hue-rotate(180deg);
+}
+body.dark .swatch.active {
+  /* Keep a clear selection ring despite the inversion filter. */
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+/* The color-dot preview must show the ink's ACTUAL appearance too, so invert
+   it in dark mode just like the swatches (black pen -> white dot, matching the
+   inverted page). Without this the dot showed the raw stored colour, so black
+   looked black and white looked white — the opposite of what draws. */
+body.dark .color-dot {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;          /* no long-press callout on touch */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;            /* no rubber-band / pull gestures */
+  touch-action: manipulation;           /* disable double-tap zoom */
+}
+/* Let the search input accept text selection so editing works. */
+#searchInput { user-select: text; -webkit-user-select: text; }
+
+/* ---------- Base button ---------- */
+button {
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: 14px;
+  min-height: 40px;              /* comfortable touch target */
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.25s ease;
+}
+button:hover { background: var(--btn-hover); border-color: var(--btn-border-hover); }
+button:active { background: var(--btn-active); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: #0a74e0; }
+
+/* ---------- Floating menu (top-right) ---------- */
+.corner-btn {
+  z-index: 30;
+  background: var(--toolbar-bg);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+}
+.corner-right-group {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.corner-right-group.hidden-bar { opacity: 0; pointer-events: none; }
+
+/* The action buttons that expand out from the 3-dots toggle. */
+.menu-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  /* Collapsed by default: animate width + opacity for a smooth reveal. */
+  max-width: 0;
+  opacity: 0;
+  transition: max-width 0.3s ease, opacity 0.25s ease;
+}
+.corner-right-group.menu-open .menu-buttons {
+  max-width: 640px;   /* enough to fit all buttons */
+  opacity: 1;
+}
+.menu-buttons .corner-btn { white-space: nowrap; flex: 0 0 auto; }
+
+/* 3-dots toggle button */
+.menu-toggle {
+  width: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.menu-toggle svg { width: 22px; height: 22px; display: block; }
+
+/* Icon button (fullscreen) shows expand OR contract icon by state. */
+.icon-btn {
+  width: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn svg { width: 20px; height: 20px; display: block; }
+.icon-btn .icon-contract { display: none; }
+body.is-fullscreen .icon-btn .icon-expand { display: none; }
+body.is-fullscreen .icon-btn .icon-contract { display: block; }
+
+/* ---------- Viewer (fixed window; the filmstrip slides inside) ---------- */
+#viewer {
+  position: absolute;
+  /* Always the FULL window height. The scrubber floats on top of the bottom
+     edge rather than shrinking the viewer, so showing/hiding the scrubber never
+     moves the page — it just uncovers the strip it was overlapping. */
+  top: 0; left: 0; right: 0; bottom: 0;
+  overflow: hidden;
+  /* We drive all panning/zooming/swiping from JS, so claim every touch here
+     (otherwise the browser can hijack a two-finger pinch and cancel our
+     pointer stream, breaking zoom in read mode). */
+  touch-action: none;
+}
+
+/* The filmstrip: a full-length row of page slots, moved via translateX. */
+.pages {
+  position: absolute;
+  top: 0; left: 0;
+  height: 100%;
+  will-change: transform;
+}
+
+/* Each slot is one page-width; slides in/out as a unit. No gaps. */
+.slot {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* No reserved band: pages centre in the FULL viewer height. The scrubber
+     floats over the bottom edge (overlapping the page a little) and, when it
+     slides away, the covered strip is revealed with no page shift and no blank
+     space below the page. */
+}
+
+.page-canvas {
+  background: #fff;
+  display: block;
+}
+
+/* ---------- Welcome ---------- */
+.welcome {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.welcome.hidden { display: none; }
+.welcome-card {
+  text-align: center;
+  padding: 40px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  max-width: 420px;
+}
+.welcome-card h1 { margin: 0 0 8px; font-weight: 600; }
+.welcome-card p { color: var(--text-dim); margin: 0 0 24px; line-height: 1.5; }
+
+/* ---------- Drop overlay ---------- */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 132, 255, 0.15);
+  border: 3px dashed var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.drop-overlay.hidden { display: none; }
+.drop-hint {
+  font-size: 22px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(0,0,0,0.5);
+  padding: 16px 28px;
+  border-radius: 12px;
+}
+
+/* ---------- Tap zones ---------- */
+.tap-zones {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 64px;
+  display: flex;
+  z-index: 5;                 /* above pages, below buttons/scrubber */
+  pointer-events: none;       /* container transparent; children opt in */
+}
+/* While no PDF is open, don't let tap zones swallow clicks on the
+   welcome screen's "Open a PDF" button. */
+.tap-zones.disabled { display: none; }
+:fullscreen .tap-zones { top: 0; bottom: 0; }
+.tap-zone {
+  pointer-events: auto;
+  touch-action: none;   /* we handle taps & swipes; no browser gestures */
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.tap-left  { flex: 0 0 15%; }
+.tap-right { flex: 0 0 15%; }
+.tap-center { flex: 1 1 auto; }  /* center toggles UI; no visual */
+
+/* Hide native scrollbar on the viewer; we use the custom scrubber */
+#viewer::-webkit-scrollbar { height: 0; width: 0; }
+
+/* ---------- Bottom scrubber (Apple Books style) ---------- */
+#scrubber {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  padding: 0 30px;
+  background: var(--bg);
+  z-index: 10;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  touch-action: none; /* the scrubber owns touch, no page panning here */
+}
+#scrubber.hidden-bar {
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+}
+#scrubber.disabled { pointer-events: none; }
+#scrubber.disabled .scrub-track { opacity: 0.5; }
+
+/* The track fills the full bar height so a finger tap anywhere along the
+   bar grabs it. The visible groove is drawn centered via ::before. */
+.scrub-track {
+  position: relative;
+  flex: 1;
+  align-self: stretch;
+  cursor: pointer;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+}
+.scrub-track::before {
+  content: "";
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 10px;
+  background: var(--track-bg);
+  border-radius: 5px;
+}
+.scrub-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 10px;
+  background: var(--accent);
+  border-radius: 5px;
+  width: 0%;
+}
+.scrub-thumb {
+  position: absolute;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  margin-left: -14px;
+  transform: translateY(-50%);
+  background: var(--accent);
+  border: 3px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+  left: 0%;
+  transition: width 0.1s ease, height 0.1s ease, margin-left 0.1s ease;
+}
+/* Grow the thumb while actively dragging for clearer touch feedback. */
+.scrub-track.grabbing .scrub-thumb {
+  width: 38px;
+  height: 38px;
+  margin-left: -19px;
+}
+/* ---------- Search ---------- */
+.scrub-search-btn {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: var(--text);
+  touch-action: none;         /* we handle the swipe gesture ourselves */
+  position: relative;
+  z-index: 2;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.scrub-search-btn svg { width: 22px; height: 22px; display: block; }
+/* When docked on the right, flex order pushes it past the track/labels. */
+#scrubber.search-right .scrub-search-btn { order: 3; margin-right: -20px; }
+/* When docked on the left (default), match the same gap as the right side. */
+#scrubber:not(.search-right) .scrub-search-btn { margin-left: -20px; }
+/* While dragging, follow the finger and lift above siblings. */
+.scrub-search-btn.dragging {
+  transition: none;
+  z-index: 50;
+  background: var(--btn-hover);
+}
+
+.search-panel {
+  position: fixed;
+  left: 16px;
+  bottom: 72px;              /* just above the 64px scrubber */
+  width: min(420px, calc(100vw - 32px));
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.22);
+  z-index: 40;
+  overflow: hidden;
+}
+.search-panel.dock-right { left: auto; right: 16px; }
+.search-panel.hidden { display: none; }
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+}
+#searchInput {
+  flex: 1;
+  min-width: 0;              /* allow shrinking below intrinsic size */
+  font-size: 16px;           /* 16px avoids mobile zoom-on-focus */
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text);
+  outline: none;
+}
+#searchInput:focus { border-color: var(--accent); }
+.search-close {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+}
+
+.search-results {
+  max-height: 46vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  border-bottom: 1px solid var(--border);
+  overflow-anchor: none;   /* we control scroll position manually */
+  scroll-behavior: auto;   /* instant snap, no lag between keystrokes */
+}
+.search-results:empty { display: none; }
+.search-item {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 15px 14px;          /* taller rows for easy tapping */
+  min-height: 48px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  touch-action: manipulation;
+}
+.search-item:last-child { border-bottom: none; }
+.search-item:hover, .search-item.active { background: var(--result-hover); }
+.search-item .si-num {
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 40px;
+}
+.search-item .si-title {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-empty {
+  padding: 14px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+/* ---------- Numpad (touch devices) ---------- */
+/* A compact 3-column grid shown instead of the OS keyboard on touchscreens.
+   Rows: 1-3 / 4-6 / 7-9 / [keyboard] 0 [backspace]. Inherits theme vars so it
+   matches light/dark automatically. */
+.numpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+}
+.numpad.hidden { display: none; }
+.np-key {
+  min-height: 46px;              /* comfortable touch target, still compact */
+  padding: 0;
+  font-size: 19px;
+  font-weight: 600;
+  border-radius: 10px;
+  background: var(--btn-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: manipulation;
+  user-select: none;
+}
+.np-key:hover { background: var(--btn-hover); border-color: var(--btn-border-hover); }
+.np-key:active { background: var(--btn-active); }
+/* Action keys (keyboard toggle, backspace) read as secondary via icon color. */
+.np-key.np-action { color: var(--text-dim); }
+.np-key.np-action:hover { color: var(--text); }
+.np-key svg { width: 24px; height: 24px; display: block; }
+
+/* ---------- Annotation layer ---------- */
+/* Page wrapper holds the PDF canvas and the transparent drawing overlay. */
+.page-wrap {
+  position: relative;
+  display: block;
+  line-height: 0;
+}
+.anno-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  touch-action: none;
+}
+/* Only capture pointer events on the overlay while drawing is active. */
+body:not(.draw-mode) .anno-canvas { pointer-events: none; }
+body.draw-mode .anno-canvas { pointer-events: auto; cursor: crosshair; }
+/* In draw mode, disable page-flip tap zones so drawing isn't interrupted. */
+body.draw-mode .tap-zones { display: none; }
+
+/* ---------- Draw tools (top-right icon row) ---------- */
+.draw-tools {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 36;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: opacity 0.2s ease;
+}
+.draw-tools.hidden { display: none; }
+/* Fade the tools out while a stroke is actively being drawn. */
+.draw-tools.drawing-active { opacity: 0.15; pointer-events: none; }
+/* In draw mode the main menu is hidden so only the draw tools show. */
+body.draw-mode .corner-right-group { display: none; }
+
+.draw-btn {
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: var(--toolbar-bg);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  color: var(--text);
+}
+.draw-btn svg { width: 22px; height: 22px; display: block; }
+.draw-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* The color circle reflects current color, size and opacity. */
+.color-btn { position: relative; }
+.color-dot {
+  display: block;
+  border-radius: 50%;
+  background: var(--pen-color, #e02424);
+  opacity: var(--pen-opacity, 0.9);
+  width: var(--pen-dot, 16px);
+  height: var(--pen-dot, 16px);
+  /* A neutral-grey ring so a white (or very light) dot stays visible against
+     the light toolbar, and a black dot stays visible on the dark toolbar. */
+  border: 1px solid rgba(128, 128, 128, 0.7);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+  box-sizing: border-box;
+  transition: width 0.1s ease, height 0.1s ease, opacity 0.1s ease;
+}
+
+/* ---------- Color / size / opacity popover ---------- */
+.color-popover {
+  position: fixed;
+  top: 64px;
+  right: 12px;
+  z-index: 37;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: var(--toolbar-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.2);
+}
+.color-popover.hidden { display: none; }
+.pop-colors {
+  display: flex;
+  flex-direction: row;   /* one line */
+  gap: 10px;
+}
+/* Slider rows: [label] [slider] [value], aligned in a fixed grid so both rows
+   line up and the changing value doesn't shift the slider. */
+.pop-row {
+  display: grid;
+  grid-template-columns: 56px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+}
+.pen-label { font-size: 13px; color: var(--text-dim); }
+/* Live readout of the slider value (e.g. "6 px", "90%"). */
+.pen-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;   /* stable width as digits change */
+  white-space: nowrap;
+}
+
+.swatch {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--sw);
+  border: 2px solid var(--border);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.swatch.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+/* On hover, keep the swatch's own colour (the generic button:hover greys it)
+   and grow it to signal "about to be selected". The #penColors prefix raises
+   specificity above button:hover so no !important is needed. Works the same in
+   light and dark themes — transform is unaffected by the dark invert filter. */
+#penColors .swatch:hover {
+  background: var(--sw);
+  border-color: var(--btn-border-hover);
+  transform: scale(1.25);
+  z-index: 1;
+}
+/* Keep the accent selection ring when hovering the already-selected swatch. */
+#penColors .swatch.active:hover {
+  border-color: var(--accent);
+}
+
+/* Touch-friendly range sliders. Fill the grid's middle column. */
+.color-popover input[type="range"] {
+  width: 100%;
+  min-width: 150px;
+  height: 36px;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  touch-action: none;
+}
+.color-popover input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track-bg);
+}
+.color-popover input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+}
+
+/* ---------- Eraser hint ---------- */
+.eraser-hint {
+  position: fixed;
+  top: 64px;
+  right: 12px;
+  z-index: 46;
+  max-width: 260px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.35;
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  transition: opacity 0.2s ease;
+}
+.eraser-hint.hidden { opacity: 0; pointer-events: none; }
+
+/* ---------- Zoom-out button (bottom-left, only while zoomed) ---------- */
+.zoom-out-btn {
+  position: fixed;
+  left: 16px;
+  bottom: 80px;                 /* above the 64px scrubber */
+  z-index: 35;
+  width: 48px;
+  height: 48px;
+  min-height: 48px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--toolbar-bg);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  color: var(--text);
+}
+.zoom-out-btn svg { width: 24px; height: 24px; display: block; }
+.zoom-out-btn.hidden { display: none; }
+:fullscreen .zoom-out-btn { bottom: 16px; }
+
+/* While zoomed, hint that the page can be dragged to pan (mouse). */
+body.zoomed #viewer { cursor: grab; }
+body.zoomed.draw-mode #viewer { cursor: crosshair; }
+
+/* ---------- Indexing progress toast ---------- */
+.index-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 80px;
+  transform: translateX(-50%);
+  z-index: 45;
+  min-width: 240px;
+  max-width: 80vw;
+  padding: 12px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
+  color: var(--text);
+  transition: opacity 0.25s ease;
+}
+.index-toast.hidden { opacity: 0; pointer-events: none; }
+.index-toast-label {
+  font-size: 13px;
+  margin-bottom: 8px;
+  text-align: center;
+}
+.index-bar {
+  height: 6px;
+  background: var(--track-bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.index-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+
+/* ---------- Import-markups prompt ---------- */
+.import-prompt {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+  padding: 16px;
+}
+.import-prompt.hidden { display: none; }
+
+.import-prompt-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  padding: 24px;
+  width: min(440px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.import-prompt-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.import-prompt-body {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.import-book-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Each book in the list is a radio-style row. */
+.import-book-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background 0.12s ease, border-color 0.12s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.import-book-item:hover { background: var(--btn-hover); }
+.import-book-item.selected {
+  border-color: var(--accent);
+  background: var(--result-hover);
+}
+.import-book-radio {
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.12s ease;
+}
+.import-book-item.selected .import-book-radio {
+  border-color: var(--accent);
+}
+.import-book-radio::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.import-book-item.selected .import-book-radio::after { opacity: 1; }
+.import-book-name {
+  font-size: 14px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-prompt-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.import-prompt-actions button {
+  min-width: 80px;
+}
+/* "From file…" button — only shown on mobile where file-pick is the workflow */
+.import-file-btn { min-width: 80px; }
+.import-file-btn.hidden { display: none; }
+
+/* ---------- Library overlay ---------- */
+.library-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+}
+.library-overlay.hidden { display: none; }
+
+/* Side-panel that slides in from the right */
+.library-panel {
+  width: min(520px, 100vw);
+  height: 100%;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 40px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: library-slide-in 0.22s ease;
+}
+@keyframes library-slide-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+/* Header row: title + close button */
+.library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.library-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+}
+.library-close-btn {
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.library-close-btn svg { width: 18px; height: 18px; display: block; }
+.library-close-btn:hover { color: var(--text); }
+
+/* Scrollable grid area */
+.library-grid {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 20px;
+  align-content: start;
+}
+
+/* Each book card */
+.library-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  cursor: pointer;
+  border-radius: 10px;
+  padding: 6px;
+  transition: background 0.15s ease;
+  position: relative;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.library-card:hover { background: var(--btn-hover); }
+.library-card.active-book .library-cover-wrap {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Book cover: shows the first-page thumbnail or a placeholder */
+.library-cover-wrap {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: 0 3px 10px var(--page-shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.library-cover-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* Placeholder shown while thumbnail is loading or missing */
+.library-cover-placeholder {
+  width: 48px;
+  height: 48px;
+  opacity: 0.2;
+  color: var(--text);
+}
+.library-cover-placeholder svg { width: 48px; height: 48px; display: block; }
+
+/* Book title under the cover */
+.library-book-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  text-align: center;
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+/* Remove button (×): appears on hover in the top-right of the card */
+.library-remove-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  z-index: 2;
+  line-height: 1;
+}
+.library-card:hover .library-remove-btn { opacity: 1; }
+.library-remove-btn:hover { background: #e02424; border-color: #e02424; color: #fff; }
+
+/* Empty state */
+.library-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 40px 20px;
+  color: var(--text-dim);
+  font-size: 15px;
+  text-align: center;
+}
+.library-empty.hidden { display: none; }
+.library-empty-sub { font-size: 13px; margin: 0; }
+.library-empty p { margin: 0; }
+
+/* "Add book" button pinned at the bottom of the panel */
+.library-add-btn {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 20px 20px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  transition: background 0.15s ease;
+}
+.library-add-btn:hover { background: #0a74e0; border-color: #0a74e0; color: #fff; }
+.library-add-btn svg { width: 20px; height: 20px; display: block; flex: 0 0 auto; }
+
+/* ---------- Library card: annotation badge + share button ---------- */
+
+/* Small pencil-mark badge on the cover's bottom-left corner */
+.library-anno-badge {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  pointer-events: none;        /* badge is decorative; don't block card clicks */
+  z-index: 2;
+}
+.library-anno-badge svg { width: 12px; height: 12px; display: block; }
+
+/* Share button: sits on the bottom-right of the cover, like the remove btn */
+.library-share-btn {
+  position: absolute;
+  bottom: 28px;              /* just above the title label */
+  right: 2px;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+  z-index: 2;
+}
+.library-share-btn svg { width: 14px; height: 14px; display: block; }
+.library-card:hover .library-share-btn { opacity: 1; }
+.library-share-btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* Markups button: same shape as share, sits above it */
+.library-markups-btn {
+  position: absolute;
+  bottom: 60px;              /* above the share button */
+  right: 2px;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+  z-index: 2;
+}
+.library-markups-btn svg { width: 14px; height: 14px; display: block; }
+.library-card:hover .library-markups-btn { opacity: 1; }
+.library-markups-btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ---------- Share dialog ---------- */
+.share-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 70;               /* above the library overlay (z-index 60) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  padding: 16px;
+}
+.share-dialog.hidden { display: none; }
+
+.share-dialog-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  padding: 24px;
+  width: min(400px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.share-dialog-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.share-dialog-body {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* Toggle row for "include markups" */
+.share-anno-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.share-anno-row.hidden { display: none; }
+
+.share-toggle-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+.share-toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.share-toggle-track {
+  display: block;
+  width: 40px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--track-bg);
+  border: 1px solid var(--border);
+  transition: background 0.2s ease, border-color 0.2s ease;
+  position: relative;
+}
+.share-toggle-input:checked ~ .share-toggle-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.share-toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+  transition: transform 0.2s ease;
+}
+.share-toggle-input:checked ~ .share-toggle-track .share-toggle-thumb {
+  transform: translateX(16px);
+}
+
+.share-anno-label {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.share-dialog-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.share-dialog-actions button { min-width: 80px; }
+
+/* ---------- Manage markups dialog ---------- */
+.manage-markups-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 75;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  padding: 16px;
+}
+.manage-markups-dialog.hidden { display: none; }
+
+.manage-markups-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  padding: 24px;
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.manage-markups-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.manage-markups-stats {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* Action rows */
+.manage-markups-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.manage-markups-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+  touch-action: manipulation;
+  width: 100%;
+}
+.manage-markups-row:hover {
+  background: var(--btn-hover);
+  border-color: var(--btn-border-hover);
+}
+.manage-markups-row--danger:hover {
+  background: rgba(224, 36, 36, 0.08);
+  border-color: #e02424;
+}
+.manage-markups-row--danger .mm-row-label { color: #e02424; }
+
+.mm-row-icon {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+.mm-row-icon svg { width: 22px; height: 22px; display: block; }
+.manage-markups-row--danger .mm-row-icon { color: #e02424; }
+
+.mm-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mm-row-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.3;
+}
+.mm-row-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* Confirmation sub-panel for Clear */
+.mm-clear-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: rgba(224, 36, 36, 0.07);
+  border: 1.5px solid rgba(224, 36, 36, 0.35);
+  border-radius: 10px;
+  animation: mm-confirm-in 0.15s ease;
+}
+.mm-clear-confirm.hidden { display: none; }
+@keyframes mm-confirm-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.mm-clear-warning {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.45;
+}
+.mm-clear-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.mm-clear-buttons button { min-width: 90px; }
+/* Danger primary button */
+button.primary.danger {
+  background: #e02424;
+  border-color: #e02424;
+}
+button.primary.danger:hover { background: #c01c1c; border-color: #c01c1c; }
+
+/* Done / close button */
+.manage-markups-close {
+  align-self: flex-end;
+  min-width: 80px;
+}
+
+/* Priority toggle inside the manage-markups dialog (shown below Merge row) */
+.mm-priority-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 4px 4px 14px;
+}
+.mm-priority-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.mm-priority-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.mm-priority-opt {
+  flex: 1;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+  min-height: 30px;
+}
+.mm-priority-opt:first-child { border-right: 1px solid var(--border); }
+.mm-priority-opt--active {
+  background: var(--accent);
+  color: #fff;
+}
+.mm-priority-opt--active:hover { background: var(--accent); }

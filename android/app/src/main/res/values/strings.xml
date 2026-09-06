@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Songbook Viewer</string>
+    <string name="title_activity_main">Songbook Viewer</string>
+    <string name="package_name">com.local.songbookviewer</string>
+    <string name="custom_url_scheme">com.local.songbookviewer</string>
+</resources>
