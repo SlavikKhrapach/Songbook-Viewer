@@ -83,6 +83,7 @@ function evictCache() {
 let currentPdfPath = null;
 let annotations = {};          // songKey -> [ stroke, ... ]
 let songKeyByPage = new Map(); // page number -> songKey (built from titles)
+let songStartPages = new Map(); // page number -> song number, ONLY for pages that truly start a song
 let undoStack = [];            // reversible actions: {type, key, ...}
 let redoStack = [];            // actions that were undone (for redo)
 const UNDO_LIMIT = 200;
@@ -129,6 +130,7 @@ const scrubber = document.getElementById('scrubber');
 const scrubTrack = document.getElementById('scrubTrack');
 const scrubFill = document.getElementById('scrubFill');
 const scrubThumb = document.getElementById('scrubThumb');
+const scrubBubble = document.getElementById('scrubBubble');
 const indexToast = document.getElementById('indexToast');
 const indexToastLabel = document.getElementById('indexToastLabel');
 const indexBarFill = document.getElementById('indexBarFill');
@@ -666,6 +668,7 @@ function fillSlotIfEmpty(n) {
 // Pages before the first detected song (front matter) fall back to "p<page>".
 function rebuildSongKeyMap() {
   songKeyByPage = new Map();
+  songStartPages = new Map();   // page -> clean song number, ONLY for real starts
   if (!pdfDoc) return;
   const total = pdfDoc.numPages;
   let currentKeyBase = null;    // e.g. "s42:ru"
@@ -682,12 +685,65 @@ function rebuildSongKeyMap() {
     }
     songKeyByPage.set(n, currentKeyBase !== null ? `${currentKeyBase}:${offset}` : `p${n}`);
   }
+
+  // Decide which pages are TRUE song starts for the scrubber bubble. The
+  // indexer parses a number off the top of every page, so table-of-contents,
+  // front matter, and the odd mis-read page all produce stray numbers. Real
+  // song numbers form the long, mostly-ascending run through the book; the
+  // strays sit off that trend. We keep the longest non-decreasing subsequence
+  // of the candidates (by page order) so a single bad value — e.g. a stray
+  // "29" early on — is DROPPED instead of poisoning the threshold and hiding
+  // songs 8..28 behind it.
+  computeSongStartPages(total);
+}
+
+// Collect (page, number) candidates and keep the longest non-decreasing
+// subsequence by page order — that run is the real song sequence. Fills
+// songStartPages with page -> "number" for those pages only.
+function computeSongStartPages(total) {
+  const cand = [];   // { page, num }
+  for (let n = 1; n <= total; n++) {
+    const entry = titleCache.get(n);
+    if (entry === undefined) continue;
+    const num = parseEntry(entry).num;
+    if (!num) continue;
+    const clean = parseInt(String(num).match(/^\s*(\d+)/)?.[1] ?? '', 10);
+    if (Number.isFinite(clean)) cand.push({ page: n, num: clean });
+  }
+  if (!cand.length) return;
+
+  // Longest non-decreasing subsequence over cand[].num (patience/DP, O(k^2) is
+  // fine for a few thousand songs). Non-decreasing allows repeats (EN/RU pairs).
+  const dp = new Array(cand.length).fill(1);
+  const prev = new Array(cand.length).fill(-1);
+  let bestEnd = 0;
+  for (let i = 0; i < cand.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (cand[j].num <= cand[i].num && dp[j] + 1 > dp[i]) {
+        dp[i] = dp[j] + 1;
+        prev[i] = j;
+      }
+    }
+    if (dp[i] > dp[bestEnd]) bestEnd = i;
+  }
+  for (let i = bestEnd; i !== -1; i = prev[i]) {
+    songStartPages.set(cand[i].page, String(cand[i].num));
+  }
 }
 
 // The annotation key for a page. Falls back to page-number key if the song
 // map hasn't been built for this page yet.
 function songKeyForPage(n) {
   return songKeyByPage.get(n) || `p${n}`;
+}
+
+// Best song number to display for a page. Uses the page's own parsed number if
+// it is a genuine song START (its number is in ascending song order — see
+// rebuildSongKeyMap). Returns '' for every other page: front matter, table of
+// contents, back matter, and the continuation pages of a multi-page song. So
+// the scrubber bubble shows only real song numbers.
+function songNumberForPage(n) {
+  return songStartPages.get(n) || '';
 }
 
 // ---------- Drawing engine ----------
@@ -994,6 +1050,21 @@ const STROKE_PICK_SLACK = 0.012;
 // snap it to a perfectly horizontal or vertical line.
 const AXIS_SNAP_DEGREES = 12;
 
+// Detect the "eraser end" of a stylus. Pointer Events expose it in a few ways
+// depending on the platform/WebView:
+//   - some report pointerType === 'eraser' outright;
+//   - most report pointerType === 'pen' with the eraser BUTTON bit set:
+//       e.buttons has bit 5 (value 32) held, or the down/up event's e.button
+//       equals 5 (the "eraser" button code).
+// Any of these means the user flipped the pen over to erase.
+function isStylusEraser(e) {
+  if (e.pointerType === 'eraser') return true;
+  if (e.pointerType !== 'pen') return false;
+  if ((e.buttons & 32) === 32) return true;   // eraser held during move
+  if (e.button === 5) return true;            // eraser reported on down/up
+  return false;
+}
+
 // True if a stroke's points stayed within the tap threshold of the start — i.e.
 // the user tapped rather than dragged. Used to distinguish an eraser tap
 // (remove whole stroke) from an eraser drag (pixel erase).
@@ -1042,6 +1113,9 @@ function attachDrawing(canvas, n) {
   let holdAnchor = null;       // pointer position when the dwell started
   let straightened = false;    // has the current stroke been snapped?
   let freehandPoints = null;   // original points, so a later move can revert
+  // Text tool: a pending placement that only commits on pointerup IF it stayed
+  // a single, still tap (not a drag, and no pinch/second finger).
+  let textPending = null;      // { id, startClientX, startClientY, moved }
 
   function clearHold() {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
@@ -1093,16 +1167,37 @@ function attachDrawing(canvas, n) {
     if (pinchActive || activeTouches.size >= 2) return;
 
     // Text tool: a press places (or edits) a text note rather than drawing.
-    if (tool === 'text' && !eraserOn) {
+    // Flipping the stylus to its eraser end erases regardless of the current
+    // tool (pen / highlighter / text).
+    const stylusErase = isStylusEraser(e);
+    const erasing = eraserOn || stylusErase;
+
+    if (tool === 'text' && !erasing) {
       e.preventDefault();
       lastFocusedPage = n;
+      if (e.pointerType === 'touch') activeTouches.set(e.pointerId, e);
       const p = toFrac(e);
       const key = songKeyForPage(n);
-      // Tap on an existing note edits it; otherwise start a new one here.
+      // Is there an existing note under the press? If so, a still tap will
+      // EDIT it and a drag will MOVE it. On empty space, a still tap places a
+      // new note. Nothing commits until pointerup (so pinch/pan never place).
       const hit = hitTestStroke(key, p.x, p.y, STROKE_PICK_SLACK);
-      const existing = (hit >= 0 && annotations[key][hit].type === 'text')
+      const existing = (hit >= 0 && annotations[key][hit] && annotations[key][hit].type === 'text')
         ? annotations[key][hit] : null;
-      openTextEditor(n, p.x, p.y, existing);
+      textPending = {
+        id: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+        key,
+        existing,
+        existingIndex: existing ? hit : -1,
+        // The grab offset: where inside the note we grabbed, so dragging keeps
+        // that point under the finger instead of snapping the corner to it.
+        grabDX: existing ? p.x - existing.x : 0,
+        grabDY: existing ? p.y - existing.y : 0,
+        dragging: false,
+      };
       return;
     }
 
@@ -1119,16 +1214,53 @@ function attachDrawing(canvas, n) {
     freehandPoints = null;
     clearHold();
     stroke = {
-      tool: eraserOn ? 'pen' : tool,   // eraser reuses the pen's round trace
+      tool: 'pen',                     // erase & pen both use the round trace
       color: penColor,
-      width: penWidth / ((parseFloat(canvas.style.width) || 1) * zoom), // px -> fraction (zoom-aware)
+      // The stylus eraser uses a comfortable fixed nib; the on-screen eraser
+      // and pens use the current pen width.
+      width: (stylusErase ? 24 : penWidth) / ((parseFloat(canvas.style.width) || 1) * zoom),
       opacity: penOpacity,
-      erase: eraserOn,
+      erase: erasing,
       points: [toFrac(e)]
     };
+    if (!erasing) stroke.tool = tool;  // keep highlighter/pen rendering when drawing
   });
 
   canvas.addEventListener('pointermove', (e) => {
+    // Text tool: track whether the pending tap turned into a drag, and keep the
+    // shared touch map current so pinch detection works.
+    if (textPending) {
+      if (e.pointerType === 'touch' && activeTouches.has(e.pointerId)) {
+        activeTouches.set(e.pointerId, e);
+      }
+      if (e.pointerId === textPending.id) {
+        const dx = e.clientX - textPending.startClientX;
+        const dy = e.clientY - textPending.startClientY;
+        // ~10px of travel = a drag, not a tap.
+        if (Math.hypot(dx, dy) > 10) textPending.moved = true;
+
+        // Dragging an existing note MOVES it. A second finger (pinch) is never
+        // a drag, so bail out of moving if one arrived.
+        if (textPending.moved && textPending.existing && activeTouches.size <= 1 && !pinchActive) {
+          if (!textPending.dragging) {
+            // Lift the note out of the array so it renders as the live layer.
+            textPending.dragging = true;
+            const arr = annotations[textPending.key];
+            const idx = arr ? arr.indexOf(textPending.existing) : -1;
+            if (idx >= 0) arr.splice(idx, 1);
+          }
+          const p = toFrac(e);
+          // Keep the grabbed point under the finger; clamp inside the page.
+          const nx = Math.min(1, Math.max(0, p.x - textPending.grabDX));
+          const ny = Math.min(1, Math.max(0, p.y - textPending.grabDY));
+          const live = { ...textPending.existing, x: nx, y: ny };
+          textPending.liveItem = live;
+          redrawAnnotations(n, live);   // draw the page + the note at its new spot
+        }
+      }
+      return;
+    }
+
     if (!active || !stroke) return;
     e.preventDefault();
     const p = toFrac(e);
@@ -1166,6 +1298,40 @@ function attachDrawing(canvas, n) {
   });
 
   function finish(e) {
+    // Text tool: resolve the pending gesture — a MOVE (dragged a note), an EDIT
+    // (tapped a note), a PLACE (tapped empty space), or nothing (pan/zoom).
+    if (textPending && e && e.pointerId === textPending.id) {
+      const pend = textPending;
+      textPending = null;
+      if (e.pointerType === 'touch') activeTouches.delete(e.pointerId);
+
+      // A note was dragged: drop it at the new position (undoable move).
+      if (pend.dragging && pend.existing) {
+        const arr = annotations[pend.key] || (annotations[pend.key] = []);
+        const idx = Math.min(pend.existingIndex, arr.length);
+        if (e.type === 'pointerup' && pend.liveItem) {
+          const moved = { ...pend.existing, x: pend.liveItem.x, y: pend.liveItem.y };
+          arr.splice(idx, 0, moved);
+          pushUndo({ type: 'edit', key: pend.key, index: idx, before: pend.existing, after: moved });
+          scheduleSave();
+        } else {
+          // Cancelled mid-drag: put the note back untouched.
+          arr.splice(idx, 0, pend.existing);
+        }
+        redrawAnnotations(n);
+        return;
+      }
+
+      // A still tap (no drag, no pinch): edit an existing note or place a new
+      // one. A drag over empty space was a pan — place nothing.
+      const wasTap = !pend.moved && !pinchActive && activeTouches.size <= 1;
+      if (e.type === 'pointerup' && wasTap) {
+        const p = toFrac(e);
+        openTextEditor(n, p.x, p.y, pend.existing);
+      }
+      return;
+    }
+
     if (e && e.pointerType === 'touch') activeTouches.delete(e.pointerId);
     drawTools.classList.remove('drawing-active');  // tools reappear
     clearHold();
@@ -1504,6 +1670,23 @@ function positionThumbAt(pct) {
   scrubThumb.style.left = `${pct * trackW}px`;
 }
 
+// Position and fill the song-number bubble above the thumb while scrubbing.
+// It's clamped to stay within the track so it never runs off either edge.
+function updateScrubBubble(page, pct) {
+  if (!scrubBubble) return;
+  const num = songNumberForPage(page);
+  // Only show the bubble when we have a real song number. Front matter / table
+  // of contents pages (no number) show nothing.
+  if (!num) { scrubBubble.classList.add('hidden'); return; }
+  scrubBubble.textContent = num;
+  scrubBubble.classList.remove('hidden');
+  const trackW = scrubTrack.clientWidth;
+  const x = Math.min(trackW, Math.max(0, pct * trackW));
+  scrubBubble.style.left = `${x}px`;
+}
+
+function hideScrubBubble() { if (scrubBubble) scrubBubble.classList.add('hidden'); }
+
 // ---------- Scrubber fast-preview + quality-settle ----------
 // While dragging, render a tiny thumbnail of each scrub position (fast,
 // no disk I/O, no cache writes) so page content is visible immediately even
@@ -1595,6 +1778,7 @@ function handleScrub(clientX) {
   const total = pdfDoc.numPages;
   const pct = total <= 1 ? 0 : (page - 1) / (total - 1);
   positionThumbAt(pct);
+  updateScrubBubble(page, pct);
 
   if (page === currentPage) return;
   currentPage = page;
@@ -1664,7 +1848,7 @@ scrubTrack.addEventListener('pointerdown', (e) => {
   isScrubbing = true;
   scrubTrack.setPointerCapture(e.pointerId);
   scrubTrack.classList.add('grabbing');
-  handleScrub(e.clientX);
+  handleScrub(e.clientX);   // this shows/positions the bubble as needed
 });
 scrubTrack.addEventListener('pointermove', (e) => {
   if (isScrubbing) handleScrub(e.clientX);
@@ -1673,6 +1857,7 @@ function endScrub() {
   if (!isScrubbing) return;
   isScrubbing = false;
   scrubTrack.classList.remove('grabbing');
+  hideScrubBubble();
   // Scrubber released — load full-quality pages for the landed position.
   triggerQualitySettle();
 }
@@ -2078,13 +2263,19 @@ menuToggle.addEventListener('click', () => {
   b.addEventListener('click', () => setMenuOpen(false));
 });
 
+// The soft/hardware "full screen" concept doesn't apply to the Android app
+// (it's already immersive), so hide that button on mobile.
+if (MOBILE && fullscreenBtn) fullscreenBtn.style.display = 'none';
+
 // ---------- Dark theme (persisted) ----------
 let darkMode = false;
 try { darkMode = localStorage.getItem('darkMode') === '1'; } catch { /* ignore */ }
 
 function applyTheme() {
   document.body.classList.toggle('dark', darkMode);
-  themeBtn.textContent = darkMode ? 'Light' : 'Dark';
+  // Icon swap (moon/sun) is handled by CSS via body.dark; keep the tooltip in
+  // sync with what tapping will do.
+  themeBtn.title = darkMode ? 'Switch to light mode' : 'Switch to dark mode';
 }
 function toggleTheme() {
   darkMode = !darkMode;
@@ -2933,12 +3124,9 @@ function buildBookCard({ filePath, displayName }, hasAnnotations = false) {
   // Placeholder icon shown until the thumbnail loads
   const placeholder = document.createElement('div');
   placeholder.className = 'library-cover-placeholder';
-  placeholder.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <rect x="4" y="2" width="14" height="20" rx="2"
-          fill="none" stroke="currentColor" stroke-width="1.6"/>
-    <path d="M8 7 H16 M8 11 H16 M8 15 H12"
-          fill="none" stroke="currentColor" stroke-width="1.4"
-          stroke-linecap="round"/>
+  // Icons: Lucide (lucide.dev), MIT licensed
+  placeholder.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/>
   </svg>`;
   coverWrap.appendChild(placeholder);
 
@@ -2948,10 +3136,9 @@ function buildBookCard({ filePath, displayName }, hasAnnotations = false) {
     badge.className = 'library-anno-badge';
     badge.title = 'Has markups';
     badge.setAttribute('aria-label', 'Has markups');
-    badge.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M15.5 4.5 L19.5 8.5 L8 20 L4 20 L4 16 Z"
-            fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round"/>
+    badge.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+      <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>
     </svg>`;
     coverWrap.appendChild(badge);
   }
@@ -2966,12 +3153,12 @@ function buildBookCard({ filePath, displayName }, hasAnnotations = false) {
   shareBtn.className = 'library-share-btn';
   shareBtn.title = 'Share / export this songbook';
   shareBtn.setAttribute('aria-label', `Share ${displayName}`);
-  shareBtn.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <circle cx="18" cy="5" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
-    <circle cx="6"  cy="12" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
-    <circle cx="18" cy="19" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
-    <path d="M8.2 10.9 L15.8 6.1 M8.2 13.1 L15.8 17.9"
-          fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  shareBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="18" cy="5" r="3"/>
+    <circle cx="6" cy="12" r="3"/>
+    <circle cx="18" cy="19" r="3"/>
+    <line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/>
+    <line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>
   </svg>`;
   shareBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -2983,12 +3170,9 @@ function buildBookCard({ filePath, displayName }, hasAnnotations = false) {
   markupsBtn.className = 'library-markups-btn';
   markupsBtn.title = 'Manage markups';
   markupsBtn.setAttribute('aria-label', `Manage markups for ${displayName}`);
-  markupsBtn.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M15.5 4.5 L19.5 8.5 L8 20 L4 20 L4 16 Z"
-          fill="none" stroke="currentColor" stroke-width="1.8"
-          stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M13 7 L17 11" fill="none" stroke="currentColor"
-          stroke-width="1.8" stroke-linecap="round"/>
+  markupsBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+    <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>
   </svg>`;
   markupsBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -3000,7 +3184,9 @@ function buildBookCard({ filePath, displayName }, hasAnnotations = false) {
   removeBtn.className = 'library-remove-btn';
   removeBtn.title = 'Remove from library';
   removeBtn.setAttribute('aria-label', `Remove ${displayName}`);
-  removeBtn.textContent = '×';
+  removeBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+  </svg>`;
   removeBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     if (window.api.removeRecentBook) await window.api.removeRecentBook(filePath);
@@ -3132,21 +3318,19 @@ const mmClearConfirm        = document.getElementById('mmClearConfirm');
 const mmClearConfirmYes     = document.getElementById('mmClearConfirmYes');
 const mmClearConfirmNo      = document.getElementById('mmClearConfirmNo');
 const manageMarkupsCloseBtn = document.getElementById('manageMarkupsCloseBtn');
-const mmPriorityMine        = document.getElementById('mmPriorityMine');
-const mmPriorityFile        = document.getElementById('mmPriorityFile');
 
 // filePath of the book currently shown in the dialog (may differ from currentPdfPath).
 let mmTargetPath = null;
 
-// 'mine' = existing marks win on conflict | 'file' = incoming file wins
-let mmMergePriority = 'mine';
+// Default merge priority. The visual resolver lets you choose per song, so this
+// is just the initial per-conflict selection (and the fallback used when a
+// non-open book can't show previews). 'mine' = keep existing on conflict.
+const mmMergePriority = 'mine';
 
 function openManageMarkupsDialog(filePath, displayName) {
   mmTargetPath = filePath;
   mmClearConfirm.classList.add('hidden');
   mmClearBtn.disabled = false;
-  // Reset priority to 'mine' each open.
-  setMergePriority('mine');
   // Update stats asynchronously so the dialog opens instantly.
   manageMarkupsStats.textContent = 'Loading…';
   manageMarkupsDialog.classList.remove('hidden');
@@ -3177,17 +3361,218 @@ async function refreshMarkupsStats(filePath) {
   }
 }
 
-function setMergePriority(prio) {
-  mmMergePriority = prio;
-  mmPriorityMine.classList.toggle('mm-priority-opt--active', prio === 'mine');
-  mmPriorityFile.classList.toggle('mm-priority-opt--active', prio === 'file');
-  mmMergeBtn.querySelector('.mm-row-desc').textContent = prio === 'mine'
-    ? 'Add marks from another file — yours take priority'
-    : 'Add marks from another file — incoming file takes priority';
+// ---------- Merge conflict resolver (visual, open book only) ----------
+// A "conflict" is a song key that has strokes in BOTH the existing marks and
+// the incoming file. Keys present on only one side always merge in cleanly.
+
+const mergeConflictDialog = document.getElementById('mergeConflictDialog');
+const mcList     = document.getElementById('mcList');
+const mcSubtitle = document.getElementById('mcSubtitle');
+const mcAllMine  = document.getElementById('mcAllMine');
+const mcAllFile  = document.getElementById('mcAllFile');
+const mcApplyBtn = document.getElementById('mcApplyBtn');
+const mcCancelBtn = document.getElementById('mcCancelBtn');
+
+// Find the first page belonging to a song key (inverse of songKeyByPage).
+function pageForSongKey(key) {
+  for (const [page, k] of songKeyByPage.entries()) {
+    if (k === key) return page;
+  }
+  return null;
 }
 
-mmPriorityMine.addEventListener('click', () => setMergePriority('mine'));
-mmPriorityFile.addEventListener('click', () => setMergePriority('file'));
+// True if a key's stroke array actually has content.
+function hasMarks(arr) { return Array.isArray(arr) && arr.length > 0; }
+
+// True if two markup sets for a song are effectively identical, so there's
+// nothing to choose between them. Compared by normalized JSON (order matters,
+// which is correct: strokes are stored in draw order).
+function sameMarks(a, b) {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  try { return JSON.stringify(a) === JSON.stringify(b); }
+  catch { return false; }
+}
+
+// Render page `n` into a preview canvas (fit to `maxW` css px) with the given
+// stroke array drawn on top. Returns a canvas element, or null on failure.
+async function renderPagePreview(n, strokes, maxW) {
+  try {
+    const page = await pdfDoc.getPage(n);
+    const vp1 = page.getViewport({ scale: 1 });
+    const scale = maxW / vp1.width;
+    const vp = page.getViewport({ scale });
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.floor(vp.width * dpr);
+    canvas.height = Math.floor(vp.height * dpr);
+    canvas.style.width = `${Math.floor(vp.width)}px`;
+    canvas.style.height = `${Math.floor(vp.height)}px`;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    // Draw the strokes/notes for this version on top (same pipeline as pages).
+    const W = canvas.width, H = canvas.height;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);   // draw items in device pixels
+    for (const item of (strokes || [])) drawItem(ctx, item, W, H);
+    return canvas;
+  } catch {
+    return null;
+  }
+}
+
+// A human label for a conflicting song key, e.g. "Song 42" (+ title if known).
+function labelForSongKey(key, page) {
+  const m = /^s(\d+):/.exec(key);
+  let label = m ? `Song ${m[1]}` : (page ? `Page ${page}` : key);
+  if (page != null) {
+    const entry = titleCache.get(page);
+    if (entry) {
+      const t = parseEntry(entry).title;
+      if (t) label += ` · ${t}`;
+    }
+  }
+  return label;
+}
+
+// State for the currently-open conflict resolution.
+let mcState = null;   // { filePath, existing, incoming, conflicts:[{key,page,choice}], autoMerged }
+
+// Open the visual resolver. `existing` and `incoming` are songKey->strokes maps.
+// Returns nothing; applying/cancelling is handled by the buttons.
+async function openMergeConflictResolver(filePath, existing, incoming) {
+  // Find conflicting keys: marks on both sides AND the two versions differ.
+  // Identical markups need no decision, so they're skipped (they merge as-is).
+  const conflicts = [];
+  for (const key of Object.keys(incoming)) {
+    if (hasMarks(incoming[key]) && hasMarks(existing[key]) &&
+        !sameMarks(incoming[key], existing[key])) {
+      conflicts.push({ key, page: pageForSongKey(key), choice: mmMergePriority });
+    }
+  }
+
+  // No conflicts: merge everything cleanly, no UI needed.
+  if (conflicts.length === 0) {
+    const merged = { ...incoming, ...existing };   // union; identical on non-conflicts
+    await applyMergedAnnotations(filePath, merged);
+    showShareToast('Markups merged.');
+    return;
+  }
+
+  mcState = { filePath, existing, incoming, conflicts };
+
+  mcSubtitle.textContent = conflicts.length === 1
+    ? '1 song has markups in both. Pick which to keep.'
+    : `${conflicts.length} songs have markups in both. Pick which to keep for each.`;
+
+  // Build a block per conflict.
+  mcList.innerHTML = '';
+  for (const c of conflicts) {
+    const block = document.createElement('div');
+    block.className = 'mc-item';
+    block.dataset.key = c.key;
+
+    const heading = document.createElement('div');
+    heading.className = 'mc-item-title';
+    heading.textContent = labelForSongKey(c.key, c.page);
+    block.appendChild(heading);
+
+    const pair = document.createElement('div');
+    pair.className = 'mc-pair';
+
+    // Two selectable options: Mine and From file.
+    for (const side of ['mine', 'file']) {
+      const opt = document.createElement('button');
+      opt.className = 'mc-option';
+      opt.dataset.side = side;
+      if (c.choice === side) opt.classList.add('mc-option--chosen');
+
+      const preview = document.createElement('div');
+      preview.className = 'mc-preview';
+      preview.textContent = '…';   // placeholder until rendered
+      opt.appendChild(preview);
+
+      const cap = document.createElement('div');
+      cap.className = 'mc-option-cap';
+      const marks = (side === 'mine' ? c.existing || existing[c.key] : incoming[c.key]) || [];
+      cap.textContent = `${side === 'mine' ? 'Mine' : 'From file'} · ${marks.length} mark${marks.length === 1 ? '' : 's'}`;
+      opt.appendChild(cap);
+
+      opt.addEventListener('click', () => {
+        c.choice = side;
+        pair.querySelectorAll('.mc-option').forEach(o =>
+          o.classList.toggle('mc-option--chosen', o.dataset.side === side));
+      });
+      pair.appendChild(opt);
+    }
+
+    block.appendChild(pair);
+    mcList.appendChild(block);
+
+    // Render both previews (page can be null if we couldn't map the key).
+    if (c.page != null) {
+      const [mineCanvas, fileCanvas] = await Promise.all([
+        renderPagePreview(c.page, existing[c.key], 300),
+        renderPagePreview(c.page, incoming[c.key], 300),
+      ]);
+      const previews = pair.querySelectorAll('.mc-preview');
+      if (mineCanvas) { previews[0].textContent = ''; previews[0].appendChild(mineCanvas); }
+      else previews[0].textContent = 'preview unavailable';
+      if (fileCanvas) { previews[1].textContent = ''; previews[1].appendChild(fileCanvas); }
+      else previews[1].textContent = 'preview unavailable';
+    } else {
+      pair.querySelectorAll('.mc-preview').forEach(p => { p.textContent = 'preview unavailable'; });
+    }
+  }
+
+  mergeConflictDialog.classList.remove('hidden');
+}
+
+function closeMergeConflictResolver() {
+  mergeConflictDialog.classList.add('hidden');
+  mcList.innerHTML = '';
+  mcState = null;
+}
+
+// Bulk-choose helpers.
+function mcSetAll(side) {
+  if (!mcState) return;
+  for (const c of mcState.conflicts) c.choice = side;
+  mcList.querySelectorAll('.mc-item').forEach(item => {
+    item.querySelectorAll('.mc-option').forEach(o =>
+      o.classList.toggle('mc-option--chosen', o.dataset.side === side));
+  });
+}
+mcAllMine.addEventListener('click', () => mcSetAll('mine'));
+mcAllFile.addEventListener('click', () => mcSetAll('file'));
+mcCancelBtn.addEventListener('click', closeMergeConflictResolver);
+
+mcApplyBtn.addEventListener('click', async () => {
+  if (!mcState) { closeMergeConflictResolver(); return; }
+  const { filePath, existing, incoming, conflicts } = mcState;
+
+  // Start from the union (non-conflicting keys from both sides come in),
+  // then apply each per-conflict choice.
+  const merged = { ...incoming, ...existing };
+  for (const c of conflicts) {
+    merged[c.key] = (c.choice === 'file') ? incoming[c.key] : existing[c.key];
+  }
+  closeMergeConflictResolver();
+  await applyMergedAnnotations(filePath, merged);
+  showShareToast('Markups merged.');
+});
+
+// Persist a merged annotation map and refresh the view if it's the open book.
+async function applyMergedAnnotations(filePath, merged) {
+  if (window.api.saveAnnotations) {
+    await window.api.saveAnnotations(filePath, merged).catch(() => {});
+  }
+  if (filePath === currentPdfPath) {
+    await reloadAnnotationsQuiet();
+    redrawVisibleAnnotations();
+  }
+}
 
 manageMarkupsCloseBtn.addEventListener('click', closeManageMarkupsDialog);
 
@@ -3199,6 +3584,12 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !manageMarkupsDialog.classList.contains('hidden')) {
     closeManageMarkupsDialog();
   }
+  if (e.key === 'Escape' && !mergeConflictDialog.classList.contains('hidden')) {
+    closeMergeConflictResolver();
+  }
+});
+mergeConflictDialog.addEventListener('click', (e) => {
+  if (e.target === mergeConflictDialog) closeMergeConflictResolver();
 });
 
 // ---- Replace ----
@@ -3264,11 +3655,20 @@ mmMergeBtn.addEventListener('click', async () => {
 
     // Load what's already on disk for this book.
     const existing = (await window.api.loadAnnotations(filePath).catch(() => null)) || {};
-    // Apply priority: the winner's keys override the loser's.
+
+    // If we're merging into the CURRENTLY OPEN book, we can render page
+    // previews — so show the visual conflict resolver (it applies + saves and
+    // handles the no-conflict fast path internally).
+    if (filePath === currentPdfPath && pdfDoc) {
+      await openMergeConflictResolver(filePath, existing, incoming);
+      return;   // resolver handles saving, reload, and the toast
+    }
+
+    // Otherwise (a different, unopened book — no PDF to preview) fall back to
+    // the priority-based merge.
     const merged = priority === 'mine'
       ? { ...incoming, ...existing }   // existing (mine) overwrites incoming
       : { ...existing, ...incoming };  // incoming (file) overwrites existing
-
     await window.api.saveAnnotations(filePath, merged);
   }
 
