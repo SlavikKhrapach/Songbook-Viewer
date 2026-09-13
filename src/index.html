@@ -86,8 +86,9 @@
         <path d="M12 4v16"/><path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2"/><path d="M9 20h6"/>
       </svg>
     </button>
-    <button id="colorBtn" class="draw-btn color-btn" title="Color, size &amp; opacity">
+    <button id="colorBtn" class="draw-btn color-btn" title="Color &amp; style">
       <span id="colorDot" class="color-dot"></span>
+      <span id="colorTextPreview" class="color-text-preview">T</span>
     </button>
     <button id="undoBtn" class="draw-btn icon-btn" title="Undo (Ctrl+Z)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -138,15 +139,27 @@
       <button class="swatch" data-color="#111111" style="--sw:#111111" title="Black"></button>
       <button class="swatch" data-color="#ffffff" style="--sw:#ffffff" title="White (black in dark mode)"></button>
     </div>
-    <div class="pop-row">
+    <!-- Pen / highlighter controls -->
+    <div class="pop-row pop-row--pen">
       <span class="pen-label">Size</span>
       <input id="penSize" type="range" min="1" max="30" value="6" />
       <span id="penSizeVal" class="pen-value">6&nbsp;px</span>
     </div>
-    <div class="pop-row">
+    <div class="pop-row pop-row--pen">
       <span class="pen-label">Opacity</span>
       <input id="penOpacity" type="range" min="10" max="100" value="90" />
       <span id="penOpacityVal" class="pen-value">90%</span>
+    </div>
+    <!-- Text controls (shown only for the Text tool) -->
+    <div class="pop-row pop-row--text">
+      <span class="pen-label">Size</span>
+      <input id="textSize" type="range" min="1" max="30" value="9" />
+      <span id="textSizeVal" class="pen-value">9</span>
+    </div>
+    <div class="pop-row pop-row--text">
+      <span class="pen-label">Weight</span>
+      <input id="textWeight" type="range" min="300" max="800" step="100" value="600" />
+      <span id="textWeightVal" class="pen-value">600</span>
     </div>
   </div>
 

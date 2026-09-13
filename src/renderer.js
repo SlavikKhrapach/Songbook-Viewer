@@ -92,6 +92,9 @@ let drawMode = false;
 let penColor = '#e02424';
 let penWidth = 6;              // logical px at 100% (scaled by pressure)
 let penOpacity = 0.9;
+// Text-note styling (active while the Text tool is selected).
+let textSize = 0.022;         // note height as a fraction of page height
+let textWeight = 600;         // font-weight (400 normal … 800 heavy)
 let eraserOn = false;
 let saveTimer = null;
 
@@ -105,6 +108,14 @@ let tool = 'pen';              // 'pen' | 'highlighter' | 'text'
 // Default text-note height as a fraction of the page height (so notes scale
 // with the page and stay consistent across zoom/render sizes).
 const TEXT_DEFAULT_SIZE = 0.022;
+// Text size slider maps 1..30 (a friendly range) to a page-height fraction.
+const TEXT_SIZE_MIN = 0.012, TEXT_SIZE_MAX = 0.06;
+function textSliderToFrac(v) {   // v: 1..30
+  return TEXT_SIZE_MIN + (Math.min(30, Math.max(1, v)) - 1) / 29 * (TEXT_SIZE_MAX - TEXT_SIZE_MIN);
+}
+function textFracToSlider(frac) {
+  return Math.round((frac - TEXT_SIZE_MIN) / (TEXT_SIZE_MAX - TEXT_SIZE_MIN) * 29 + 1);
+}
 
 // Each tool remembers its own colour / size / opacity so switching back and
 // forth doesn't clobber the other's settings. The `pen*` globals mirror
@@ -113,7 +124,8 @@ const TEXT_DEFAULT_SIZE = 0.022;
 const toolState = {
   pen:         { color: '#e02424', width: 6,  opacity: 0.9 },
   highlighter: { color: '#f8e71c', width: 22, opacity: 0.35 },
-  text:        { color: '#e02424', width: 6,  opacity: 1 },
+  // Text keeps its own size (page-height fraction) and font weight.
+  text:        { color: '#111111', size: 0.022, weight: 600 },
 };
 
 // ---------- Elements ----------
@@ -141,12 +153,17 @@ const penBtn = document.getElementById('penBtn');
 const drawTools = document.getElementById('drawTools');
 const colorBtn = document.getElementById('colorBtn');
 const colorDot = document.getElementById('colorDot');
+const colorTextPreview = document.getElementById('colorTextPreview');
 const colorPopover = document.getElementById('colorPopover');
 const penColors = document.getElementById('penColors');
 const penSize = document.getElementById('penSize');
 const penOpacityEl = document.getElementById('penOpacity');
 const penSizeVal = document.getElementById('penSizeVal');
 const penOpacityVal = document.getElementById('penOpacityVal');
+const textSizeEl = document.getElementById('textSize');
+const textWeightEl = document.getElementById('textWeight');
+const textSizeVal = document.getElementById('textSizeVal');
+const textWeightVal = document.getElementById('textWeightVal');
 const eraserBtn = document.getElementById('eraserBtn');
 const undoBtn = document.getElementById('undoBtn');
 const redoBtn = document.getElementById('redoBtn');
@@ -785,7 +802,8 @@ function drawItem(ctx, item, W, H) {
 // overall width/height. (x, y) is the note's TOP-LEFT anchor in page fractions.
 function textNoteMetrics(ctx, t, W, H) {
   const fontPx = (t.size || TEXT_DEFAULT_SIZE) * H;
-  ctx.font = `${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  const weight = t.weight || 600;
+  ctx.font = `${weight} ${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
   const lines = String(t.text || '').split('\n');
   const lineH = fontPx * 1.25;
   let maxW = 0;
@@ -927,9 +945,21 @@ function openTextEditor(n, fx, fy, existing) {
 
   const pageW = parseFloat(canvas.style.width) || wrap.clientWidth;
   const pageH = parseFloat(canvas.style.height) || wrap.clientHeight;
-  const color = existing ? existing.color : penColor;
-  const size = existing ? (existing.size || TEXT_DEFAULT_SIZE) : TEXT_DEFAULT_SIZE;
+  const color = existing ? (existing.color || penColor) : penColor;
+  const size = existing ? (existing.size || TEXT_DEFAULT_SIZE) : textSize;
+  const weight = existing ? (existing.weight || 600) : textWeight;
   const fontPx = size * pageH;
+
+  // Seed the live style controls from the note being edited, so the color/
+  // size/weight sliders show (and can change) THIS note's style.
+  penColor = color;
+  textSize = size;
+  textWeight = weight;
+  toolState.text = { color, size, weight };
+  if (textSizeEl) textSizeEl.value = String(textFracToSlider(size));
+  if (textWeightEl) textWeightEl.value = String(weight);
+  syncSwatchSelection();
+  updateColorDot();
 
   const ta = document.createElement('textarea');
   ta.className = 'text-note-input';
@@ -938,11 +968,11 @@ function openTextEditor(n, fx, fy, existing) {
   ta.style.left = `${fx * pageW}px`;
   ta.style.top = `${fy * pageH}px`;
   ta.style.color = color;
-  ta.style.font = `${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ta.style.font = `${weight} ${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
   ta.style.lineHeight = '1.25';
   wrap.appendChild(ta);
 
-  textEditor = { ta, n, key, fx, fy, color, size, editIndex, original: existing || null };
+  textEditor = { ta, n, key, fx, fy, color, size, weight, editIndex, original: existing || null };
 
   // Auto-grow to fit content.
   const autosize = () => {
@@ -971,6 +1001,9 @@ function openTextEditor(n, fx, fy, existing) {
     setTimeout(() => {
       // Focus returned to the same textarea (keyboard bounce) => not a real blur.
       if (document.activeElement === ta) return;
+      // The blur was caused by tapping a style control in the popover — keep the
+      // editor open and hand focus back so live restyling can continue.
+      if (popoverInteracting) { ta.focus(); return; }
       if (!settled) { ta.focus(); return; }   // keyboard still opening; keep it
       closeTextEditor(true);
     }, 0);
@@ -979,6 +1012,27 @@ function openTextEditor(n, fx, fy, existing) {
 
   // Focus after layout so mobile keyboards open reliably.
   setTimeout(() => { ta.focus(); ta.select(); }, 0);
+}
+
+// Re-apply the current text style (penColor / textSize / textWeight) to the
+// OPEN editor, so changing color/size/weight while a note is being edited
+// updates it live. Committing then saves the new style. No-op if no editor.
+function restyleTextEditor() {
+  if (!textEditor) return;
+  const ed = textEditor;
+  const canvas = annoCanvasFor(ed.n);
+  const pageH = canvas ? (parseFloat(canvas.style.height) || canvas.clientHeight) : 0;
+  ed.color = penColor;
+  ed.size = textSize;
+  ed.weight = textWeight;
+  const fontPx = (pageH ? textSize * pageH : 16);
+  ed.ta.style.color = penColor;
+  ed.ta.style.font = `${textWeight} ${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ed.ta.style.lineHeight = '1.25';
+  // Keep the textarea sized to its (possibly larger/smaller) font.
+  ed.ta.style.width = 'auto'; ed.ta.style.height = 'auto';
+  ed.ta.style.width = `${Math.max(ed.ta.scrollWidth + 4, fontPx)}px`;
+  ed.ta.style.height = `${ed.ta.scrollHeight}px`;
 }
 
 // Close the editor. commit=true bakes non-empty text into an annotation item.
@@ -999,11 +1053,11 @@ function closeTextEditor(commit) {
     let w = 0, h = 0;
     if (canvas) {
       const ctx = canvas.getContext('2d');
-      const m = textNoteMetrics(ctx, { text, size: ed.size }, canvas.width, canvas.height);
+      const m = textNoteMetrics(ctx, { text, size: ed.size, weight: ed.weight }, canvas.width, canvas.height);
       w = m.width / canvas.width;
       h = m.height / canvas.height;
     }
-    const item = { type: 'text', x: ed.fx, y: ed.fy, text, color: ed.color, size: ed.size, w, h };
+    const item = { type: 'text', x: ed.fx, y: ed.fy, text, color: ed.color, size: ed.size, weight: ed.weight, w, h };
     if (ed.editIndex >= 0) {
       // Editing an existing note: put the new version back in its place. Undo
       // restores the ORIGINAL note (stored on the action) at that index.
@@ -2463,9 +2517,29 @@ importPrompt.addEventListener('click', (e) => {
   if (e.target === importPrompt) hideImportPrompt();
 });
 
-// Update the color circle to reflect current color, size and opacity.
+// Update the color-button preview to reflect the active tool's style. For pen /
+// highlighter it shows a coloured dot sized by width & opacity; for the Text
+// tool it shows a "T" whose size, weight and colour mirror the note settings.
 function updateColorDot() {
-  // Map pen width (1..30) to a visible dot diameter (10..34px).
+  const isText = (tool === 'text' && !eraserOn);
+
+  // Toggle which preview is visible.
+  if (colorDot) colorDot.style.display = isText ? 'none' : 'block';
+  if (colorTextPreview) colorTextPreview.style.display = isText ? 'flex' : 'none';
+
+  if (isText) {
+    // Map the text size fraction to a preview font size (12..26px) in the button.
+    const slider = textFracToSlider(textSize);          // 1..30
+    const px = Math.round(12 + (Math.min(30, Math.max(1, slider)) - 1) / 29 * 14);
+    colorTextPreview.style.color = penColor;
+    colorTextPreview.style.fontSize = `${px}px`;
+    colorTextPreview.style.fontWeight = String(textWeight);
+    if (textSizeVal) textSizeVal.textContent = String(slider);
+    if (textWeightVal) textWeightVal.textContent = String(textWeight);
+    return;
+  }
+
+  // Pen / highlighter dot.
   const dia = Math.round(10 + (Math.min(30, Math.max(1, penWidth)) / 30) * 24);
   colorDot.style.setProperty('--pen-color', penColor);
   colorDot.style.setProperty('--pen-opacity', String(penOpacity));
@@ -2500,12 +2574,22 @@ function setTool(next) {
   // Commit any open text note before switching tools.
   closeTextEditor(true);
   // Save the current tool's settings before switching away.
-  toolState[tool] = { color: penColor, width: penWidth, opacity: penOpacity };
+  if (tool === 'text') {
+    toolState.text = { color: penColor, size: textSize, weight: textWeight };
+  } else {
+    toolState[tool] = { color: penColor, width: penWidth, opacity: penOpacity };
+  }
+
   tool = next;
   const ts = toolState[tool];
   penColor = ts.color;
-  penWidth = ts.width;
-  penOpacity = ts.opacity;
+  if (tool === 'text') {
+    textSize = ts.size ?? TEXT_DEFAULT_SIZE;
+    textWeight = ts.weight ?? 600;
+  } else {
+    penWidth = ts.width;
+    penOpacity = ts.opacity;
+  }
 
   // Picking a drawing tool always leaves eraser mode.
   eraserOn = false;
@@ -2515,9 +2599,16 @@ function setTool(next) {
   for (const [name, btn] of Object.entries(toolBtns)) {
     if (btn) btn.classList.toggle('active', name === tool);
   }
+
+  // Show the right controls in the popover: pen size/opacity vs text size/weight.
+  const showText = (tool === 'text');
+  colorPopover.classList.toggle('show-text', showText);
+
   // Push the restored values into the popover controls.
   if (penSize) penSize.value = String(penWidth);
   if (penOpacityEl) penOpacityEl.value = String(Math.round(penOpacity * 100));
+  if (textSizeEl) textSizeEl.value = String(textFracToSlider(textSize));
+  if (textWeightEl) textWeightEl.value = String(textWeight);
   syncSwatchSelection();
   updateColorDot();
 }
@@ -2542,6 +2633,23 @@ function hideColorPopover() { colorPopover.classList.add('hidden'); }
 colorBtn.addEventListener('click', () => {
   colorPopover.classList.toggle('hidden');
 });
+// While a text note is being edited, using the popover (sliders, swatches)
+// blurs the textarea — which would normally commit & close the editor. We do
+// NOT block the controls (that broke slider dragging). Instead we mark that the
+// blur came from a popover interaction, so the blur handler keeps the editor
+// open instead of committing. The controls work natively.
+let popoverInteracting = false;
+function markPopoverInteracting() {
+  popoverInteracting = true;
+  // Clear shortly after the interaction ends.
+  clearTimeout(markPopoverInteracting._t);
+  markPopoverInteracting._t = setTimeout(() => { popoverInteracting = false; }, 300);
+}
+colorPopover.addEventListener('pointerdown', markPopoverInteracting, true);
+colorPopover.addEventListener('pointermove', () => {
+  if (popoverInteracting) markPopoverInteracting();   // keep alive during a drag
+}, true);
+colorBtn.addEventListener('pointerdown', markPopoverInteracting, true);
 penColors.addEventListener('click', (e) => {
   const sw = e.target.closest('.swatch');
   if (!sw) return;
@@ -2555,7 +2663,9 @@ penColors.addEventListener('click', (e) => {
   }
   penColors.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
   sw.classList.add('active');
+  if (tool === 'text') toolState.text.color = penColor;
   updateColorDot();
+  restyleTextEditor();   // recolor the open note, if any
 });
 penSize.addEventListener('input', () => {
   penWidth = Number(penSize.value);
@@ -2566,6 +2676,18 @@ penOpacityEl.addEventListener('input', () => {
   penOpacity = Number(penOpacityEl.value) / 100;
   toolState[tool].opacity = penOpacity;
   updateColorDot();
+});
+textSizeEl.addEventListener('input', () => {
+  textSize = textSliderToFrac(Number(textSizeEl.value));
+  toolState.text.size = textSize;
+  updateColorDot();
+  restyleTextEditor();   // resize the open note, if any
+});
+textWeightEl.addEventListener('input', () => {
+  textWeight = Number(textWeightEl.value);
+  toolState.text.weight = textWeight;
+  updateColorDot();
+  restyleTextEditor();   // re-weight the open note, if any
 });
 
 // ----- Eraser: tap to toggle, press-and-hold to clear the page -----
