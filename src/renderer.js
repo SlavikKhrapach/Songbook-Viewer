@@ -94,6 +94,27 @@ let penOpacity = 0.9;
 let eraserOn = false;
 let saveTimer = null;
 
+// ---------- Tool presets ----------
+// The active drawing tool. 'pen' = freehand ink, 'highlighter' = wide,
+// translucent, multiply-blended marker that never hides the print beneath it,
+// 'text' = tap to drop a small typed note (capo, key, "x2", etc.).
+// Pen & highlighter can be snapped to a straight line by holding still at the
+// end of a stroke (see attachDrawing's hold-to-straighten gesture).
+let tool = 'pen';              // 'pen' | 'highlighter' | 'text'
+// Default text-note height as a fraction of the page height (so notes scale
+// with the page and stay consistent across zoom/render sizes).
+const TEXT_DEFAULT_SIZE = 0.022;
+
+// Each tool remembers its own colour / size / opacity so switching back and
+// forth doesn't clobber the other's settings. The `pen*` globals mirror
+// whichever tool is currently active (so all the existing UI keeps working).
+// The text tool only uses `color` (size is fixed via TEXT_DEFAULT_SIZE).
+const toolState = {
+  pen:         { color: '#e02424', width: 6,  opacity: 0.9 },
+  highlighter: { color: '#f8e71c', width: 22, opacity: 0.35 },
+  text:        { color: '#e02424', width: 6,  opacity: 1 },
+};
+
 // ---------- Elements ----------
 const viewer = document.getElementById('viewer');
 const track = document.getElementById('pages'); // horizontal filmstrip
@@ -694,20 +715,68 @@ function redrawAnnotations(n, live) {
   const W = canvas.width, H = canvas.height;
 
   const strokes = annotations[songKeyForPage(n)] || [];
-  for (const s of strokes) compositeStroke(ctx, s, W, H);
-  if (live) compositeStroke(ctx, live, W, H);
+  for (const s of strokes) drawItem(ctx, s, W, H);
+  if (live) drawItem(ctx, live, W, H);
+}
+
+// Draw one annotation item — a text note or a stroke — onto the context.
+function drawItem(ctx, item, W, H) {
+  if (item && item.type === 'text') drawTextNote(ctx, item, W, H);
+  else compositeStroke(ctx, item, W, H);
+}
+
+// Measure a text note's box in canvas pixels: its font size, line metrics, and
+// overall width/height. (x, y) is the note's TOP-LEFT anchor in page fractions.
+function textNoteMetrics(ctx, t, W, H) {
+  const fontPx = (t.size || TEXT_DEFAULT_SIZE) * H;
+  ctx.font = `${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  const lines = String(t.text || '').split('\n');
+  const lineH = fontPx * 1.25;
+  let maxW = 0;
+  for (const ln of lines) maxW = Math.max(maxW, ctx.measureText(ln).width);
+  return { fontPx, lineH, lines, width: maxW, height: lineH * lines.length };
+}
+
+// Render a text note. Draws each line left-aligned from the (x, y) top-left.
+function drawTextNote(ctx, t, W, H) {
+  if (!t.text) return;
+  ctx.save();
+  const m = textNoteMetrics(ctx, t, W, H);
+  ctx.fillStyle = t.color || '#e02424';
+  ctx.textBaseline = 'top';
+  ctx.globalAlpha = 1;
+  const x = t.x * W, y = t.y * H;
+  for (let i = 0; i < m.lines.length; i++) {
+    ctx.fillText(m.lines[i], x, y + i * m.lineH);
+  }
+  ctx.restore();
 }
 
 // Trace a stroke's path onto a context (no alpha handling here).
 function traceStroke(ctx, s, W, H, colorOverride) {
   ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
   ctx.strokeStyle = colorOverride || s.color || '#e02424';
   ctx.fillStyle = ctx.strokeStyle;
   const baseW = (s.width || 0.01) * W;
   const pts = s.points;
 
+  // All tools use round caps for smooth, rounded stroke ends.
+  ctx.lineCap = 'round';
+
+  // A straightened stroke (via hold-to-straighten, or the legacy line tool) is
+  // a clean segment between its two endpoints.
+  if ((s.straight || s.tool === 'line') && pts.length >= 2) {
+    const a = pts[0], b = pts[pts.length - 1];
+    ctx.lineWidth = baseW;
+    ctx.beginPath();
+    ctx.moveTo(a.x * W, a.y * H);
+    ctx.lineTo(b.x * W, b.y * H);
+    ctx.stroke();
+    return;
+  }
+
   if (pts.length === 1) {
+    // A single dab: a round dot for every tool.
     ctx.beginPath();
     ctx.arc(pts[0].x * W, pts[0].y * H, baseW / 2, 0, Math.PI * 2);
     ctx.fill();
@@ -717,7 +786,9 @@ function traceStroke(ctx, s, W, H, colorOverride) {
   ctx.moveTo(pts[0].x * W, pts[0].y * H);
   for (let i = 1; i < pts.length; i++) {
     const p = pts[i];
-    ctx.lineWidth = baseW * (p.pr ? (0.5 + p.pr) : 1);
+    // The highlighter keeps a constant width (pressure would look uneven on a
+    // marker); ink still tapers with stylus pressure.
+    ctx.lineWidth = (s.tool === 'highlighter') ? baseW : baseW * (p.pr ? (0.5 + p.pr) : 1);
     ctx.lineTo(p.x * W, p.y * H);
     ctx.stroke();
     ctx.beginPath();
@@ -738,9 +809,13 @@ function compositeStroke(ctx, s, W, H) {
     return;
   }
 
+  // Highlighter blends with 'multiply' so the ink tints the print rather than
+  // painting over it — the notes/lyrics stay readable underneath the mark.
+  const blend = s.tool === 'highlighter' ? 'multiply' : 'source-over';
   const opacity = s.opacity ?? 1;
-  if (opacity >= 1) {
-    // Fully opaque: no self-overlap issue, draw directly.
+
+  if (opacity >= 1 && blend === 'source-over') {
+    // Fully opaque ink: no self-overlap issue, draw directly.
     ctx.save();
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
@@ -749,8 +824,10 @@ function compositeStroke(ctx, s, W, H) {
     return;
   }
 
-  // Translucent: render the stroke opaque on an offscreen buffer, then blit
-  // the flattened shape onto the page once at the stroke's opacity.
+  // Translucent (or highlighter): render the stroke opaque on an offscreen
+  // buffer, then blit the flattened shape onto the page once at the stroke's
+  // opacity and blend mode. Flattening keeps the opacity UNIFORM even where the
+  // stroke overlaps itself.
   const buf = getStrokeBuffer(W, H);
   const bctx = buf.getContext('2d');
   bctx.clearRect(0, 0, W, H);
@@ -759,10 +836,140 @@ function compositeStroke(ctx, s, W, H) {
   traceStroke(bctx, s, W, H);
 
   ctx.save();
-  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalCompositeOperation = blend;
   ctx.globalAlpha = opacity;
   ctx.drawImage(buf, 0, 0);
   ctx.restore();
+}
+
+// ---------- Text notes ----------
+// Only one text editor is open at a time. It's a floating <textarea> positioned
+// over the page-wrap; committing bakes the text into an annotation item.
+let textEditor = null;
+
+// Open the text editor at fractional point (fx, fy) on page n. If `existing`
+// is an annotation item, we're editing it in place (it's temporarily removed
+// from the array and re-added on commit).
+function openTextEditor(n, fx, fy, existing) {
+  closeTextEditor(true);   // commit/close any open editor first
+
+  const canvas = annoCanvasFor(n);
+  const wrap = canvas && canvas.closest('.page-wrap');
+  if (!wrap) return;
+
+  const key = songKeyForPage(n);
+  // If editing an existing note, pull it out of the array while editing (so the
+  // live canvas text doesn't double up with the textarea). Keep the original so
+  // a cancel can restore it untouched.
+  let editIndex = -1;
+  if (existing) {
+    const arr = annotations[key] || [];
+    editIndex = arr.indexOf(existing);
+    if (editIndex >= 0) { arr.splice(editIndex, 1); redrawAnnotations(n); }
+    fx = existing.x; fy = existing.y;
+  }
+
+  const pageW = parseFloat(canvas.style.width) || wrap.clientWidth;
+  const pageH = parseFloat(canvas.style.height) || wrap.clientHeight;
+  const color = existing ? existing.color : penColor;
+  const size = existing ? (existing.size || TEXT_DEFAULT_SIZE) : TEXT_DEFAULT_SIZE;
+  const fontPx = size * pageH;
+
+  const ta = document.createElement('textarea');
+  ta.className = 'text-note-input';
+  ta.value = existing ? existing.text : '';
+  ta.rows = 1;
+  ta.style.left = `${fx * pageW}px`;
+  ta.style.top = `${fy * pageH}px`;
+  ta.style.color = color;
+  ta.style.font = `${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ta.style.lineHeight = '1.25';
+  wrap.appendChild(ta);
+
+  textEditor = { ta, n, key, fx, fy, color, size, editIndex, original: existing || null };
+
+  // Auto-grow to fit content.
+  const autosize = () => {
+    ta.style.width = 'auto';
+    ta.style.height = 'auto';
+    ta.style.width = `${Math.max(ta.scrollWidth + 4, fontPx)}px`;
+    ta.style.height = `${ta.scrollHeight}px`;
+  };
+  ta.addEventListener('input', autosize);
+  autosize();
+
+  // Commit on Enter (Shift+Enter = newline), cancel on Escape.
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); closeTextEditor(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeTextEditor(false); }
+    e.stopPropagation();   // don't let page shortcuts fire while typing
+  });
+
+  // Commit when focus really leaves the editor — but IGNORE the transient blur
+  // that fires while the soft keyboard is animating in on mobile (the WebView
+  // briefly shuffles focus). We only honour a blur once the editor has settled
+  // AND focus didn't bounce straight back to the textarea.
+  let settled = false;
+  const settleTimer = setTimeout(() => { settled = true; }, 400);
+  ta.addEventListener('blur', () => {
+    setTimeout(() => {
+      // Focus returned to the same textarea (keyboard bounce) => not a real blur.
+      if (document.activeElement === ta) return;
+      if (!settled) { ta.focus(); return; }   // keyboard still opening; keep it
+      closeTextEditor(true);
+    }, 0);
+  });
+  textEditor.settleCleanup = () => clearTimeout(settleTimer);
+
+  // Focus after layout so mobile keyboards open reliably.
+  setTimeout(() => { ta.focus(); ta.select(); }, 0);
+}
+
+// Close the editor. commit=true bakes non-empty text into an annotation item.
+function closeTextEditor(commit) {
+  if (!textEditor) return;
+  const ed = textEditor;
+  textEditor = null;                 // clear first so blur handler is a no-op
+  if (ed.settleCleanup) ed.settleCleanup();
+  const text = ed.ta.value.replace(/\s+$/,'').trimStart();
+  ed.ta.remove();
+
+  const canvas = annoCanvasFor(ed.n);
+  if (!annotations[ed.key]) annotations[ed.key] = [];
+  const arr = annotations[ed.key];
+
+  if (commit && text) {
+    // Measure the note so hit-testing/erase have a bounding box (in fractions).
+    let w = 0, h = 0;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      const m = textNoteMetrics(ctx, { text, size: ed.size }, canvas.width, canvas.height);
+      w = m.width / canvas.width;
+      h = m.height / canvas.height;
+    }
+    const item = { type: 'text', x: ed.fx, y: ed.fy, text, color: ed.color, size: ed.size, w, h };
+    if (ed.editIndex >= 0) {
+      // Editing an existing note: put the new version back in its place. Undo
+      // restores the ORIGINAL note (stored on the action) at that index.
+      arr.splice(ed.editIndex, 0, item);
+      pushUndo({ type: 'edit', key: ed.key, index: ed.editIndex, before: ed.original, after: item });
+    } else {
+      arr.push(item);
+      pushUndo({ type: 'add', key: ed.key, page: ed.n, stroke: item });
+    }
+    scheduleSave();
+  } else if (ed.editIndex >= 0) {
+    if (!commit && ed.original) {
+      // Cancelled an edit: restore the original note untouched, no undo entry.
+      arr.splice(ed.editIndex, 0, ed.original);
+    } else {
+      // Committed but empty => the note was deleted. Record it as undoable.
+      pushUndo({ type: 'remove', key: ed.key, index: ed.editIndex, stroke: ed.original });
+      scheduleSave();
+    }
+  }
+  if (arr.length === 0) delete annotations[ed.key];
+  if (canvas) redrawAnnotations(ed.n);
 }
 
 // A registry of "abort" callbacks for any in-progress stroke, so a pinch
@@ -772,11 +979,88 @@ function abortActiveStrokes() {
   for (const abort of [...activeStrokeAborts]) abort();
 }
 
+// How long the pointer must dwell (nearly motionless) at the end of a stroke
+// before it snaps to a straight line, and how far it may drift during that
+// dwell while still counting as "held still" (in canvas fractions).
+const STRAIGHTEN_HOLD_MS = 900;
+const STRAIGHTEN_JITTER = 0.006;   // ~ a few px; movement under this = "still"
+// With the eraser: a stroke that travels less than this (in fractions of the
+// page) counts as a TAP and removes the whole stroke under it, rather than
+// pixel-erasing. A longer drag pixel-erases as before.
+const ERASER_TAP_MAX_MOVE = 0.02;
+// Extra pick radius (fraction of page) so thin strokes are still easy to tap.
+const STROKE_PICK_SLACK = 0.012;
+// If the drawn stroke's overall angle is within this many degrees of an axis,
+// snap it to a perfectly horizontal or vertical line.
+const AXIS_SNAP_DEGREES = 12;
+
+// True if a stroke's points stayed within the tap threshold of the start — i.e.
+// the user tapped rather than dragged. Used to distinguish an eraser tap
+// (remove whole stroke) from an eraser drag (pixel erase).
+function isTap(points) {
+  if (!points || points.length === 0) return true;
+  const a = points[0];
+  for (const p of points) {
+    if (Math.hypot(p.x - a.x, p.y - a.y) > ERASER_TAP_MAX_MOVE) return false;
+  }
+  return true;
+}
+
+// Produce the straightened version of a freehand stroke: a two-point segment
+// from its first to its last point, snapped to horizontal/vertical when the
+// overall angle is close to an axis.
+function straightenPoints(points) {
+  if (!points || points.length < 2) return points;
+  const a = points[0];
+  const b = points[points.length - 1];
+  let x0 = a.x, y0 = a.y, x1 = b.x, y1 = b.y;
+
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const angle = Math.abs(Math.atan2(dy, dx) * 180 / Math.PI); // 0..180
+  const nearHorizontal = angle <= AXIS_SNAP_DEGREES || angle >= 180 - AXIS_SNAP_DEGREES;
+  const nearVertical = Math.abs(angle - 90) <= AXIS_SNAP_DEGREES;
+
+  if (nearHorizontal) {
+    const y = (y0 + y1) / 2;   // level it out
+    y0 = y1 = y;
+  } else if (nearVertical) {
+    const x = (x0 + x1) / 2;
+    x0 = x1 = x;
+  }
+  // Preserve pressure of the endpoints so ink width stays sensible.
+  return [{ x: x0, y: y0, pr: a.pr || 0 }, { x: x1, y: y1, pr: b.pr || 0 }];
+}
+
 // Attach pointer drawing handlers to an overlay canvas.
 function attachDrawing(canvas, n) {
   let active = false;
   let stroke = null;
   let activePointerId = null;
+  // "Hold at the end to straighten" state.
+  let holdTimer = null;
+  let holdAnchor = null;       // pointer position when the dwell started
+  let straightened = false;    // has the current stroke been snapped?
+  let freehandPoints = null;   // original points, so a later move can revert
+
+  function clearHold() {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    holdAnchor = null;
+  }
+
+  // Called when the pointer has dwelt in place long enough: snap the stroke.
+  function applyStraighten() {
+    holdTimer = null;
+    if (!active || !stroke || stroke.erase) return;
+    if (!stroke.points || stroke.points.length < 2) return;
+    freehandPoints = stroke.points;        // remember for possible revert
+    stroke.points = straightenPoints(stroke.points);
+    stroke.straight = true;                // render as a clean 2-point segment
+    straightened = true;
+    redrawAnnotations(n, stroke);
+    // A light haptic nudge on devices that support it.
+    try { if (navigator.vibrate) navigator.vibrate(15); } catch { /* ignore */ }
+  }
 
   function toFrac(e) {
     const r = canvas.getBoundingClientRect();
@@ -793,6 +1077,9 @@ function attachDrawing(canvas, n) {
     if (!active) return;
     active = false;
     stroke = null;
+    clearHold();
+    straightened = false;
+    freehandPoints = null;
     activeStrokeAborts.delete(abort);
     try { if (activePointerId != null) canvas.releasePointerCapture(activePointerId); } catch { /* ignore */ }
     activePointerId = null;
@@ -804,6 +1091,21 @@ function attachDrawing(canvas, n) {
     if (!drawMode) return;
     // A pinch (2+ touch points) owns the gesture — never start a stroke.
     if (pinchActive || activeTouches.size >= 2) return;
+
+    // Text tool: a press places (or edits) a text note rather than drawing.
+    if (tool === 'text' && !eraserOn) {
+      e.preventDefault();
+      lastFocusedPage = n;
+      const p = toFrac(e);
+      const key = songKeyForPage(n);
+      // Tap on an existing note edits it; otherwise start a new one here.
+      const hit = hitTestStroke(key, p.x, p.y, STROKE_PICK_SLACK);
+      const existing = (hit >= 0 && annotations[key][hit].type === 'text')
+        ? annotations[key][hit] : null;
+      openTextEditor(n, p.x, p.y, existing);
+      return;
+    }
+
     if (e.pointerType === 'touch') activeTouches.set(e.pointerId, e);
     e.preventDefault();
     lastFocusedPage = n;   // remember which page was last interacted with
@@ -813,7 +1115,11 @@ function attachDrawing(canvas, n) {
     canvas.setPointerCapture(e.pointerId);
     hideColorPopover();               // close the color panel when drawing starts
     drawTools.classList.add('drawing-active');  // fade tools out of the way
+    straightened = false;
+    freehandPoints = null;
+    clearHold();
     stroke = {
+      tool: eraserOn ? 'pen' : tool,   // eraser reuses the pen's round trace
       color: penColor,
       width: penWidth / ((parseFloat(canvas.style.width) || 1) * zoom), // px -> fraction (zoom-aware)
       opacity: penOpacity,
@@ -825,7 +1131,35 @@ function attachDrawing(canvas, n) {
   canvas.addEventListener('pointermove', (e) => {
     if (!active || !stroke) return;
     e.preventDefault();
-    stroke.points.push(toFrac(e));
+    const p = toFrac(e);
+
+    if (straightened) {
+      // Already snapped to a straight line. A tiny wobble is ignored so the
+      // line stays put; a deliberate move reverts to the original freehand
+      // stroke (so an accidental pause doesn't trap the user).
+      const moved = Math.hypot(p.x - holdAnchor.x, p.y - holdAnchor.y);
+      if (moved > STRAIGHTEN_JITTER * 4) {
+        stroke.points = freehandPoints;
+        stroke.straight = false;
+        straightened = false;
+        freehandPoints = null;
+      } else {
+        return;   // hold the straight line steady
+      }
+    }
+
+    stroke.points.push(p);
+
+    // Restart the dwell timer whenever the pointer moves more than a hair; if
+    // it stays put, the timer survives and eventually straightens the stroke.
+    if (!stroke.erase && stroke.points.length >= 2) {
+      if (!holdAnchor || Math.hypot(p.x - holdAnchor.x, p.y - holdAnchor.y) > STRAIGHTEN_JITTER) {
+        holdAnchor = p;
+        if (holdTimer) clearTimeout(holdTimer);
+        holdTimer = setTimeout(applyStraighten, STRAIGHTEN_HOLD_MS);
+      }
+    }
+
     // Redraw the page with the in-progress stroke composited uniformly, so a
     // translucent stroke shows even opacity while being drawn.
     redrawAnnotations(n, stroke);
@@ -834,11 +1168,27 @@ function attachDrawing(canvas, n) {
   function finish(e) {
     if (e && e.pointerType === 'touch') activeTouches.delete(e.pointerId);
     drawTools.classList.remove('drawing-active');  // tools reappear
+    clearHold();
+    straightened = false;
+    freehandPoints = null;
     if (!active || !stroke) return;
     active = false;
     activeStrokeAborts.delete(abort);
     activePointerId = null;
     const key = songKeyForPage(n);
+
+    // Eraser TAP (barely moved): remove the whole stroke under the point
+    // instead of committing a pixel-erase stroke. A drag falls through to the
+    // normal pixel eraser below.
+    if (stroke.erase && isTap(stroke.points)) {
+      const p = stroke.points[0];
+      const hit = hitTestStroke(key, p.x, p.y, STROKE_PICK_SLACK);
+      stroke = null;
+      if (hit >= 0) removeStrokeAt(key, hit, n);
+      else redrawAnnotations(n);   // nothing hit: just clear the tap dab
+      return;
+    }
+
     if (!annotations[key]) annotations[key] = [];
     annotations[key].push(stroke);
     pushUndo({ type: 'add', key, page: n, stroke });
@@ -1705,7 +2055,7 @@ function openPdfDialog() {
   }
 }
 libraryBtn.addEventListener('click', openLibrary);
-document.getElementById('welcomeOpenBtn').addEventListener('click', openLibrary);
+document.getElementById('welcomeOpenBtn').addEventListener('click', openPdfDialog);
 fullscreenBtn.addEventListener('click', () => {
   if (!document.fullscreenElement) document.documentElement.requestFullscreen();
   else document.exitFullscreen();
@@ -1941,11 +2291,59 @@ function setDrawMode(on) {
   penBtn.classList.toggle('active', on);
   // Entering draw mode collapses the main menu buttons behind the 3-dots.
   if (on) setMenuOpen(false);
-  if (!on) { hideColorPopover(); hideEraserHint(); }
+  if (!on) { hideColorPopover(); hideEraserHint(); closeTextEditor(true); }
   updateColorDot();
 }
 penBtn.addEventListener('click', () => setDrawMode(!drawMode));
+
+// ----- Tool selection (pen / highlighter / line) -----
+const toolBtns = {
+  pen:         document.getElementById('toolPenBtn'),
+  highlighter: document.getElementById('toolHighlighterBtn'),
+  text:        document.getElementById('toolTextBtn'),
+};
+
+// Switch the active drawing tool, restoring that tool's remembered color/size/
+// opacity and reflecting it in the toolbar + color popover.
+function setTool(next) {
+  // Commit any open text note before switching tools.
+  closeTextEditor(true);
+  // Save the current tool's settings before switching away.
+  toolState[tool] = { color: penColor, width: penWidth, opacity: penOpacity };
+  tool = next;
+  const ts = toolState[tool];
+  penColor = ts.color;
+  penWidth = ts.width;
+  penOpacity = ts.opacity;
+
+  // Picking a drawing tool always leaves eraser mode.
+  eraserOn = false;
+  eraserBtn.classList.remove('active');
+
+  // Highlight the active tool button.
+  for (const [name, btn] of Object.entries(toolBtns)) {
+    if (btn) btn.classList.toggle('active', name === tool);
+  }
+  // Push the restored values into the popover controls.
+  if (penSize) penSize.value = String(penWidth);
+  if (penOpacityEl) penOpacityEl.value = String(Math.round(penOpacity * 100));
+  syncSwatchSelection();
+  updateColorDot();
+}
+
+// Mark the swatch matching the current color as selected (used after a tool
+// switch changes the active color).
+function syncSwatchSelection() {
+  penColors.querySelectorAll('.swatch').forEach(s =>
+    s.classList.toggle('active', s.dataset.color === penColor));
+}
+
+for (const [name, btn] of Object.entries(toolBtns)) {
+  if (btn) btn.addEventListener('click', () => setTool(name));
+}
+
 updateColorDot();   // reflect defaults on the color circle
+setTool('pen');     // establish the initial active-tool highlight
 
 // ----- Color popover -----
 function showColorPopover() { colorPopover.classList.remove('hidden'); }
@@ -1957,14 +2355,27 @@ penColors.addEventListener('click', (e) => {
   const sw = e.target.closest('.swatch');
   if (!sw) return;
   penColor = sw.dataset.color;
-  eraserOn = false;
-  eraserBtn.classList.remove('active');
+  toolState[tool].color = penColor;   // remember for the active tool
+  // Choosing a colour implies drawing, not erasing.
+  if (eraserOn) {
+    eraserOn = false;
+    eraserBtn.classList.remove('active');
+    if (toolBtns[tool]) toolBtns[tool].classList.add('active');
+  }
   penColors.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
   sw.classList.add('active');
   updateColorDot();
 });
-penSize.addEventListener('input', () => { penWidth = Number(penSize.value); updateColorDot(); });
-penOpacityEl.addEventListener('input', () => { penOpacity = Number(penOpacityEl.value) / 100; updateColorDot(); });
+penSize.addEventListener('input', () => {
+  penWidth = Number(penSize.value);
+  toolState[tool].width = penWidth;
+  updateColorDot();
+});
+penOpacityEl.addEventListener('input', () => {
+  penOpacity = Number(penOpacityEl.value) / 100;
+  toolState[tool].opacity = penOpacity;
+  updateColorDot();
+});
 
 // ----- Eraser: tap to toggle, press-and-hold to clear the page -----
 let eraserHoldTimer = null;
@@ -1991,6 +2402,11 @@ function eraserRelease() {
     // A tap: toggle eraser mode and explain what it does.
     eraserOn = !eraserOn;
     eraserBtn.classList.toggle('active', eraserOn);
+    // While erasing, no drawing tool is active; restore the tool highlight when
+    // erasing is turned back off.
+    for (const [name, btn] of Object.entries(toolBtns)) {
+      if (btn) btn.classList.toggle('active', !eraserOn && name === tool);
+    }
     showEraserHint();
   }
   eraserHeld = false;
@@ -2016,6 +2432,67 @@ function pushUndo(action) {
   redoStack = [];
 }
 
+// Shortest distance (in fractional units, x & y normalised to page size) from
+// a point to a line segment. Used for stroke hit-testing.
+function distToSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// Find the topmost stroke on song key `key` that lies under fractional point
+// (fx, fy). Returns its index, or -1 if nothing is close enough. Later strokes
+// (drawn on top) win. `slack` is an extra pick radius in fractions so thin
+// strokes are still easy to tap.
+function hitTestStroke(key, fx, fy, slack) {
+  const strokes = annotations[key];
+  if (!strokes || !strokes.length) return -1;
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    const s = strokes[i];
+    // Text notes: hit-test against the stored bounding box (in fractions),
+    // padded by the slack so they're easy to tap.
+    if (s.type === 'text') {
+      const w = s.w || 0, h = s.h || 0;
+      if (fx >= s.x - slack && fx <= s.x + w + slack &&
+          fy >= s.y - slack && fy <= s.y + h + slack) return i;
+      continue;
+    }
+    const pts = s.points;
+    if (!pts || !pts.length) continue;
+    // Half the stroke width plus the slack defines how near a tap must land.
+    const tol = (s.width || 0.01) / 2 + slack;
+    if (pts.length === 1) {
+      if (Math.hypot(fx - pts[0].x, fy - pts[0].y) <= tol) return i;
+      continue;
+    }
+    // A straightened stroke is only its two endpoints; freehand walks segments.
+    if (s.straight || s.tool === 'line') {
+      const a = pts[0], b = pts[pts.length - 1];
+      if (distToSegment(fx, fy, a.x, a.y, b.x, b.y) <= tol) return i;
+      continue;
+    }
+    for (let j = 1; j < pts.length; j++) {
+      if (distToSegment(fx, fy, pts[j - 1].x, pts[j - 1].y, pts[j].x, pts[j].y) <= tol) return i;
+    }
+  }
+  return -1;
+}
+
+// Remove the whole stroke at `index` on song key `key` (from a tap with the
+// eraser). Recorded as an undoable action that restores the stroke in place.
+function removeStrokeAt(key, index, page) {
+  const strokes = annotations[key];
+  if (!strokes || index < 0 || index >= strokes.length) return;
+  const [removed] = strokes.splice(index, 1);
+  if (strokes.length === 0) delete annotations[key];
+  pushUndo({ type: 'remove', key, index, stroke: removed });
+  redrawAnnotations(page);
+  scheduleSave();
+}
+
 // Redraw whichever visible page currently maps to a given song key.
 function redrawKeyIfVisible(key) {
   const pages = [currentPage];
@@ -2037,6 +2514,20 @@ function undoStroke() {
     if (arr && arr.length === 0) delete annotations[action.key];
     redoStack.push({ type: 'add', key: action.key, stroke: removed });
     redrawKeyIfVisible(action.key);
+  } else if (action.type === 'remove') {
+    // Undo a single-stroke removal: put the stroke back at its old index.
+    if (!annotations[action.key]) annotations[action.key] = [];
+    const arr = annotations[action.key];
+    const idx = Math.min(action.index, arr.length);
+    arr.splice(idx, 0, action.stroke);
+    redoStack.push(action);
+    redrawKeyIfVisible(action.key);
+  } else if (action.type === 'edit') {
+    // Undo a text-note edit: swap the edited note back to its previous version.
+    const arr = annotations[action.key];
+    if (arr && action.index < arr.length) arr[action.index] = action.before;
+    redoStack.push(action);
+    redrawKeyIfVisible(action.key);
   } else if (action.type === 'clear') {
     for (const [key, strokes] of Object.entries(action.snapshot)) {
       annotations[key] = strokes;
@@ -2056,6 +2547,21 @@ function redoStroke() {
     if (!annotations[action.key]) annotations[action.key] = [];
     annotations[action.key].push(action.stroke);
     undoStack.push({ type: 'add', key: action.key, stroke: action.stroke });
+    redrawKeyIfVisible(action.key);
+  } else if (action.type === 'remove') {
+    // Re-apply the removal.
+    const arr = annotations[action.key];
+    if (arr && action.index < arr.length) {
+      arr.splice(action.index, 1);
+      if (arr.length === 0) delete annotations[action.key];
+    }
+    undoStack.push(action);
+    redrawKeyIfVisible(action.key);
+  } else if (action.type === 'edit') {
+    // Redo a text-note edit: swap the edited version back in.
+    const arr = annotations[action.key];
+    if (arr && action.index < arr.length) arr[action.index] = action.after;
+    undoStack.push(action);
     redrawKeyIfVisible(action.key);
   } else if (action.type === 'clear') {
     // Re-apply the clear: remove the keys it originally cleared.
@@ -2181,7 +2687,7 @@ function updatePinch() {
 function inChrome(target) {
   return !!(target.closest && target.closest(
     '#scrubber, #searchPanel, .draw-tools, .corner-right-group, ' +
-    '.color-popover, #zoomOutBtn, .eraser-hint'
+    '.color-popover, #zoomOutBtn, .eraser-hint, .text-note-input'
   ));
 }
 
@@ -2278,6 +2784,13 @@ window.addEventListener('keydown', (e) => {
   }
   // Don't hijack keys while typing in the search box.
   if (document.activeElement === searchInput) return;
+  // Tool shortcuts while in draw mode: P=pen, H=highlighter, L=line, E=eraser.
+  if (drawMode && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key === 'p' || e.key === 'P') { e.preventDefault(); setTool('pen'); return; }
+    if (e.key === 'h' || e.key === 'H') { e.preventDefault(); setTool('highlighter'); return; }
+    if (e.key === 't' || e.key === 'T') { e.preventDefault(); setTool('text'); return; }
+    if (e.key === 'e' || e.key === 'E') { e.preventDefault(); eraserRelease(); return; }
+  }
   if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
     e.preventDefault(); next();
   } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
@@ -2296,8 +2809,17 @@ window.addEventListener('keydown', (e) => {
 
 // ---------- Re-layout on resize / rotation ----------
 let resizeTimer = null;
+let lastLayoutWidth = window.innerWidth;
 window.addEventListener('resize', () => {
   if (!pdfDoc) return;
+
+  // While a text note is being edited, a 'resize' is almost always the soft
+  // keyboard opening/closing (height-only). Re-laying out would rebuild the
+  // page DOM and destroy the open editor (dismissing the keyboard). A genuine
+  // rotation/resize changes the WIDTH — only then do we relayout mid-edit.
+  if (textEditor && window.innerWidth === lastLayoutWidth) return;
+
+  lastLayoutWidth = window.innerWidth;
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(async () => {
     renderToken++;

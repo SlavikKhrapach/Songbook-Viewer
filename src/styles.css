@@ -500,6 +500,33 @@ body.is-fullscreen .icon-btn .icon-contract { display: block; }
 /* Only capture pointer events on the overlay while drawing is active. */
 body:not(.draw-mode) .anno-canvas { pointer-events: none; }
 body.draw-mode .anno-canvas { pointer-events: auto; cursor: crosshair; }
+
+/* Floating editor for a text note. Positioned over the page-wrap at the tap
+   point; its font/colour mirror how the committed note will render, so what
+   you type is what you get. */
+.text-note-input {
+  position: absolute;
+  z-index: 40;
+  margin: 0;
+  padding: 0 2px;
+  border: 1px dashed var(--accent, #2d9cdb);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.85);
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+  box-sizing: content-box;
+  min-width: 1ch;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+}
+body.dark .text-note-input {
+  background: rgba(20, 20, 20, 0.9);
+  /* The committed note is drawn on the anno-canvas, which is inverted in dark
+     mode. The editor sits OUTSIDE that canvas, so invert its ink the same way
+     to preview the true on-page colour (matches the .color-dot trick). */
+  filter: invert(1) hue-rotate(180deg);
+}
 /* In draw mode, disable page-flip tap zones so drawing isn't interrupted. */
 body.draw-mode .tap-zones { display: none; }
 
@@ -537,10 +564,24 @@ body.draw-mode .corner-right-group { display: none; }
 .draw-btn svg { width: 22px; height: 22px; display: block; }
 .draw-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
+/* A thin separator between the tool group (pen/highlighter/line) and the
+   colour/action buttons, so the toolbar reads as two logical groups. */
+.color-btn {
+  margin-left: 6px;
+  border-left: 1px solid var(--btn-border, rgba(128, 128, 128, 0.35));
+  padding-left: 6px;
+  border-radius: 10px;
+}
+
 /* The color circle reflects current color, size and opacity. */
 .color-btn { position: relative; }
 .color-dot {
-  display: block;
+  /* Absolutely centered in the button so the separator padding doesn't nudge
+     it off-center, and it stays centered as its size changes with pen width. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   border-radius: 50%;
   background: var(--pen-color, #e02424);
   opacity: var(--pen-opacity, 0.9);
