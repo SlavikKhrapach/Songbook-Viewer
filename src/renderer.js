@@ -3000,7 +3000,8 @@ function updatePinch() {
 function inChrome(target) {
   return !!(target.closest && target.closest(
     '#scrubber, #searchPanel, .draw-tools, .corner-right-group, ' +
-    '.color-popover, #zoomOutBtn, .eraser-hint, .text-note-input'
+    '.color-popover, #zoomOutBtn, .eraser-hint, .text-note-input, .mc-zoom-overlay, ' +
+    '#mergeConflictDialog'
   ));
 }
 
@@ -3123,6 +3124,15 @@ window.addEventListener('keydown', (e) => {
 // ---------- Re-layout on resize / rotation ----------
 let resizeTimer = null;
 let lastLayoutWidth = window.innerWidth;
+// Keep the conflict reviewer's layout (wide vs narrow) in sync with the window
+// width, debounced, independent of the main page viewer's relayout.
+let reviewResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!mcZoom || mcZoomOverlay.classList.contains('hidden')) return;
+  clearTimeout(reviewResizeTimer);
+  reviewResizeTimer = setTimeout(relayoutReviewer, 150);
+});
+
 window.addEventListener('resize', () => {
   if (!pdfDoc) return;
 
@@ -3494,6 +3504,18 @@ const mcAllMine  = document.getElementById('mcAllMine');
 const mcAllFile  = document.getElementById('mcAllFile');
 const mcApplyBtn = document.getElementById('mcApplyBtn');
 const mcCancelBtn = document.getElementById('mcCancelBtn');
+const mcReviewBtn = document.getElementById('mcReviewBtn');
+
+// The resolver list owns its own wheel scroll so it never bubbles to the page
+// behind it (which would flip/scroll the PDF).
+if (mcList) {
+  mcList.addEventListener('wheel', (e) => {
+    const before = mcList.scrollTop;
+    mcList.scrollTop += e.deltaY;
+    // If the list actually scrolled, swallow the event so the page doesn't.
+    if (mcList.scrollTop !== before) { e.preventDefault(); e.stopPropagation(); }
+  }, { passive: false });
+}
 
 // Find the first page belonging to a song key (inverse of songKeyByPage).
 function pageForSongKey(key) {
@@ -3529,8 +3551,8 @@ async function renderPagePreview(n, strokes, maxW) {
     const canvas = document.createElement('canvas');
     canvas.width = Math.floor(vp.width * dpr);
     canvas.height = Math.floor(vp.height * dpr);
-    canvas.style.width = `${Math.floor(vp.width)}px`;
-    canvas.style.height = `${Math.floor(vp.height)}px`;
+    // Don't set inline pixel width/height — let CSS scale it responsively while
+    // the width/height ATTRIBUTES above preserve the true page aspect ratio.
     const ctx = canvas.getContext('2d');
     ctx.scale(dpr, dpr);
     await page.render({ canvasContext: ctx, viewport: vp }).promise;
@@ -3542,6 +3564,579 @@ async function renderPagePreview(n, strokes, maxW) {
   } catch {
     return null;
   }
+}
+
+// ---------- Full-screen conflict reviewer (vertical snap-pager) ----------
+// One "page" per conflicting song fills the screen and shows BOTH versions
+// (Mine / From file). Long-press a version to select it; scroll/swipe down
+// snaps to the next pair. Pinch-zoom on one version mirrors onto the other so
+// you inspect the same region on both. Selections write to conflicts[].choice.
+const mcZoomOverlay   = document.getElementById('mcZoomOverlay');
+const mcZoomPager     = document.getElementById('mcZoomPager');
+const mcZoomProgress  = document.getElementById('mcZoomProgress');
+const mcZoomTitle     = document.getElementById('mcZoomTitle');
+const mcZoomClose     = document.getElementById('mcZoomClose');
+
+const MC_HOLD_MS = 500;             // long-press duration to select
+let mcZoom = null;                  // { pages:[...], index }
+
+// Open the reviewer at conflict `startIndex`, rendering from mcState.conflicts.
+async function openConflictReview(startIndex) {
+  if (!mcState || !mcState.conflicts.length) return;
+  const { existing, incoming, conflicts } = mcState;
+  mcZoomPager.innerHTML = '<div class="mc-zoom-loading">Loading…</div>';
+  mcZoomOverlay.classList.remove('hidden');
+
+  // "Narrow" screens can't fit two page columns, so they show ONE version at a
+  // time (swipe sideways for the other). Wide screens show both side by side.
+  const narrow = (window.innerWidth || 800) < 720;
+  const widthFactor = narrow ? 0.95 : 0.55;
+  const targetW = Math.min(1600, Math.round((window.innerWidth || 800) * (window.devicePixelRatio || 1) * widthFactor));
+
+  // Build one full-screen page per conflict.
+  mcZoomPager.innerHTML = '';
+  const pages = [];
+  for (let ci = 0; ci < conflicts.length; ci++) {
+    const c = conflicts[ci];
+    const pageEl = document.createElement('div');
+    pageEl.className = 'mc-page';
+    // Title now lives in the shared top bar (#mcZoomTitle), updated on snap.
+
+    const pair = document.createElement('div');
+    pair.className = 'mc-page-pair';
+    pageEl.appendChild(pair);
+
+    const sides = [];
+    for (const side of ['mine', 'file']) {
+      const opt = document.createElement('div');
+      opt.className = 'mc-page-opt';
+      opt.dataset.side = side;
+      if (c.choice === side) opt.classList.add('mc-page-opt--chosen');
+
+      const stage = document.createElement('div');   // clips + holds the zoomable canvas
+      stage.className = 'mc-page-stage';
+      const inner = document.createElement('div');
+      inner.className = 'mc-page-inner';
+      stage.appendChild(inner);
+      opt.appendChild(stage);
+
+      const cap = document.createElement('div');
+      cap.className = 'mc-page-cap';
+      const marks = (side === 'mine' ? existing[c.key] : incoming[c.key]) || [];
+      cap.innerHTML = `<span>${side === 'mine' ? 'Mine' : 'From file'} · ${marks.length} mark${marks.length === 1 ? '' : 's'}</span>`;
+      opt.appendChild(cap);
+
+      pair.appendChild(opt);
+      const sideObj = { side, opt, stage, inner, zoom: 1, panX: 0, panY: 0, baseW: 0, baseH: 0 };
+      sides.push(sideObj);
+      // Selection on tap is handled centrally in attachReviewGestures'
+      // endPointer (the pager captures the pointer, so per-option click
+      // listeners don't reliably fire).
+    }
+
+    mcZoomPager.appendChild(pageEl);
+    pages.push({ c, el: pageEl, pair, sides, rendered: false, hIndex: 0 });
+  }
+
+  mcZoomOverlay.classList.toggle('mc-narrow', narrow);
+  const hintEl = document.getElementById('mcZoomHint');
+  if (hintEl) hintEl.textContent = narrow
+    ? 'Tap or Enter to choose · swipe/‹ › for the other version · up/down for the next pair'
+    : 'Tap or Enter to choose · ‹ › to focus a version · up/down for the next pair';
+  mcZoom = { pages, index: 0, targetW, narrow, suppressClick: false };
+
+  // Render the starting page (and neighbours) then snap to it.
+  const start = Math.max(0, Math.min(conflicts.length - 1, startIndex || 0));
+  await renderReviewPage(start);
+  renderReviewPage(start + 1);   // prefetch next (no await)
+  snapToReviewPage(start, false);
+  attachReviewGestures();
+  updateReviewProgress();
+}
+
+// Recompute the reviewer layout when the window is resized. Switches between
+// the wide (two versions side by side) and narrow (one at a time, swipe to
+// switch) layouts live, mirroring how the main page viewer re-lays out on
+// resize. Re-renders the canvases at the new width so they stay crisp.
+function relayoutReviewer() {
+  if (!mcZoom || mcZoomOverlay.classList.contains('hidden')) return;
+
+  const w = window.innerWidth || 800;
+  const narrow = w < 720;
+  const widthFactor = narrow ? 0.95 : 0.55;
+  const targetW = Math.min(1600, Math.round(w * (window.devicePixelRatio || 1) * widthFactor));
+  const modeChanged = narrow !== mcZoom.narrow;
+  const targetChanged = Math.abs(targetW - (mcZoom.targetW || 0)) > 20;
+
+  mcZoom.narrow = narrow;
+  mcZoom.targetW = targetW;
+  mcZoomOverlay.classList.toggle('mc-narrow', narrow);
+
+  if (modeChanged) {
+    const hintEl = document.getElementById('mcZoomHint');
+    if (hintEl) hintEl.textContent = narrow
+      ? 'Tap or Enter to choose · swipe/‹ › for the other version · up/down for the next pair'
+      : 'Tap or Enter to choose · ‹ › to focus a version · up/down for the next pair';
+  }
+
+  // If width changed enough (or the layout mode flipped), the cached canvases
+  // are the wrong resolution — mark pages for re-render and re-render the ones
+  // near the current index. Otherwise just re-fit the existing canvases.
+  if (modeChanged || targetChanged) {
+    mcZoom.pages.forEach(pg => { pg.rendered = false; });
+    renderReviewPage(mcZoom.index);
+    renderReviewPage(mcZoom.index + 1);
+    renderReviewPage(mcZoom.index - 1);
+  } else {
+    mcZoom.pages.forEach(pg => pg.sides.forEach(s => { measureReviewSide(s); applyReviewTransform(s); }));
+  }
+
+  // Fix the pair transform: in narrow mode position the track on the current
+  // version; in wide mode clear the inline translate so the grid isn't shifted.
+  mcZoom.pages.forEach(pg => {
+    if (narrow) {
+      snapPairVersion(pg, pg.hIndex || 0, false);
+    } else {
+      pg.pair.style.transition = 'none';
+      pg.pair.style.transform = '';
+    }
+  });
+}
+
+// Render both version canvases for review page `pi` (once).
+async function renderReviewPage(pi) {
+  if (!mcZoom || pi < 0 || pi >= mcZoom.pages.length) return;
+  const pg = mcZoom.pages[pi];
+  if (pg.rendered) return;
+  pg.rendered = true;
+  const c = pg.c;
+  if (c.page == null) {
+    pg.sides.forEach(s => { s.inner.innerHTML = '<div class="mc-zoom-loading">preview unavailable</div>'; });
+    return;
+  }
+  const [mineCanvas, fileCanvas] = await Promise.all([
+    renderPagePreview(c.page, mcState.existing[c.key], mcZoom.targetW),
+    renderPagePreview(c.page, mcState.incoming[c.key], mcZoom.targetW),
+  ]);
+  const canvases = [mineCanvas, fileCanvas];
+  pg.sides.forEach((s, i) => {
+    s.inner.innerHTML = '';
+    if (canvases[i]) s.inner.appendChild(canvases[i]);
+    else s.inner.innerHTML = '<div class="mc-zoom-loading">preview unavailable</div>';
+  });
+  // Measure + center once laid out.
+  requestAnimationFrame(() => { pg.sides.forEach(s => { measureReviewSide(s); applyReviewTransform(s); }); });
+}
+
+// Best-guess stage size for a side. An off-screen side in the narrow
+// horizontal track can report clientWidth/Height 0 even though it's laid out
+// (and every side is the same size as the on-screen one). So if this stage
+// reads 0, borrow a sibling side's measured stage, or fall back to the pager.
+function stageSizeFor(s) {
+  let w = s.stage.clientWidth, h = s.stage.clientHeight;
+  if (w && h) return { w, h };
+  const pg = mcZoom && mcZoom.pages && mcZoom.pages[mcZoom.index];
+  if (pg) {
+    for (const o of pg.sides) {
+      if (o.stage.clientWidth && o.stage.clientHeight) {
+        return { w: o.stage.clientWidth, h: o.stage.clientHeight };
+      }
+    }
+  }
+  if (mcZoomPager && mcZoomPager.clientWidth && mcZoomPager.clientHeight) {
+    // Approximate: the stage is the page minus header/hint/caption padding.
+    return { w: mcZoomPager.clientWidth - 24, h: mcZoomPager.clientHeight - 130 };
+  }
+  return { w, h };
+}
+
+function measureReviewSide(s) {
+  const canvas = s.inner.querySelector('canvas');
+  const { w: stageW, h: stageH } = stageSizeFor(s);
+  // If the canvas isn't mounted yet or we still couldn't determine a usable
+  // stage size, try again next frame instead of giving up — otherwise the
+  // canvas is left unsized and shows up blank.
+  if (!canvas || !stageW || !stageH) {
+    s.baseW = stageW; s.baseH = stageH;
+    if (canvas && (!stageW || !stageH) && (s._measureTries = (s._measureTries || 0) + 1) < 30) {
+      requestAnimationFrame(() => { measureReviewSide(s); applyReviewTransform(s); });
+    }
+    return;
+  }
+  s._measureTries = 0;
+
+  // Contain-fit the WHOLE page inside the stage from the canvas's natural
+  // pixel size (never crop). We size the canvas explicitly instead of relying
+  // on CSS percentages, which don't resolve reliably inside flex columns and
+  // were causing pages to overflow/clip.
+  const natW = canvas.width || canvas.naturalWidth || stageW;
+  const natH = canvas.height || canvas.naturalHeight || stageH;
+  const pad = 0.98;   // a hair of breathing room
+  const fit = Math.min((stageW * pad) / natW, (stageH * pad) / natH);
+  const dispW = Math.round(natW * fit);
+  const dispH = Math.round(natH * fit);
+  canvas.style.width = dispW + 'px';
+  canvas.style.height = dispH + 'px';
+  s.baseW = dispW;
+  s.baseH = dispH;
+}
+
+function clampReviewPan(s) {
+  const { w: stageW, h: stageH } = stageSizeFor(s);
+  const sw = (s.baseW || stageW) * s.zoom;
+  const sh = (s.baseH || stageH) * s.zoom;
+  if (sw <= stageW) s.panX = (stageW - sw) / 2; else s.panX = Math.min(0, Math.max(stageW - sw, s.panX));
+  if (sh <= stageH) s.panY = (stageH - sh) / 2; else s.panY = Math.min(0, Math.max(stageH - sh, s.panY));
+}
+
+function applyReviewTransform(s) {
+  clampReviewPan(s);
+  s.inner.style.transformOrigin = '0 0';
+  s.inner.style.transform = `translate(${s.panX}px, ${s.panY}px) scale(${s.zoom})`;
+}
+
+// Apply the SAME zoom/pan (as content fractions) to both sides of a page, so
+// inspecting one shows the identical region on the other.
+function syncReviewZoom(pg, source) {
+  const fx = source.baseW ? (-source.panX + 0) / (source.baseW * source.zoom) : 0;
+  const fy = source.baseH ? (-source.panY + 0) / (source.baseH * source.zoom) : 0;
+  for (const s of pg.sides) {
+    if (s === source) continue;
+    s.zoom = source.zoom;
+    // Map the same top-left content fraction onto this side's own base size.
+    s.panX = -fx * (s.baseW * s.zoom);
+    s.panY = -fy * (s.baseH * s.zoom);
+    s.inner.style.transition = 'none';
+    applyReviewTransform(s);
+  }
+}
+
+function resetReviewSide(s) {
+  s.zoom = 1; s.panX = 0; s.panY = 0;
+  applyReviewTransform(s);
+}
+
+function snapToReviewPage(i, animate = true) {
+  if (!mcZoom) return;
+  i = Math.max(0, Math.min(mcZoom.pages.length - 1, i));
+  mcZoom.index = i;
+  mcZoomPager.style.transition = animate ? 'transform 0.28s ease' : 'none';
+  mcZoomPager.style.transform = `translateY(${-i * 100}%)`;
+  // Reset zoom on the page we're showing so it starts as full pages.
+  const pg = mcZoom.pages[i];
+  pg.sides.forEach(resetReviewSide);
+  if (mcZoom.narrow) snapPairVersion(pg, pg.hIndex || 0, false);
+  // Show the keyboard-focus ring on the current version of this pair.
+  pg.sides.forEach((o, si) => o.opt.classList.toggle('mc-page-opt--focused', si === (pg.hIndex || 0)));
+  renderReviewPage(i);
+  renderReviewPage(i + 1);
+  updateReviewProgress();
+}
+
+// Narrow screens only: slide the pair's horizontal track to show version `hi`
+// (0 = Mine, 1 = From file).
+function snapPairVersion(pg, hi, animate = true) {
+  hi = Math.max(0, Math.min(pg.sides.length - 1, hi));
+  pg.hIndex = hi;
+  pg.pair.style.transition = animate ? 'transform 0.16s ease-out' : 'none';
+  // The narrow track is 200% wide (two slots). translateX % is relative to the
+  // track's own width, so one slot = 50%.
+  pg.pair.style.transform = `translateX(${-hi * 50}%)`;
+  // Re-fit/center the version we're revealing. The off-screen side may have
+  // been measured before layout settled, leaving its canvas unsized and blank;
+  // measuring now (with the retry counter reset) fixes that.
+  const s = pg.sides[hi];
+  if (s) {
+    s._measureTries = 0;
+    requestAnimationFrame(() => { measureReviewSide(s); applyReviewTransform(s); });
+  }
+}
+
+function updateReviewProgress() {
+  if (!mcZoom) return;
+  const total = mcZoom.pages.length;
+  const chosen = mcState.conflicts.filter(c => c.choice === 'mine' || c.choice === 'file').length;
+  mcZoomProgress.textContent = `${mcZoom.index + 1} / ${total} · ${chosen} chosen`;
+  // Keep the shared top-bar title in sync with the visible pair.
+  if (mcZoomTitle) {
+    const cur = mcZoom.pages[mcZoom.index];
+    mcZoomTitle.textContent = cur ? labelForSongKey(cur.c.key, cur.c.page) : '';
+  }
+}
+
+// Select a side as the choice for the given review page (writes to the shared
+// conflicts[].choice so Apply merge uses it), with a chosen visual.
+function selectReviewSide(pg, s) {
+  pg.c.choice = s.side;
+  pg.sides.forEach(o => o.opt.classList.toggle('mc-page-opt--chosen', o === s));
+  // Mirror the choice back onto the small inline list.
+  const item = mcList.querySelector(`.mc-item[data-key="${cssEscape(pg.c.key)}"]`);
+  if (item) item.querySelectorAll('.mc-option').forEach(o =>
+    o.classList.toggle('mc-option--chosen', o.dataset.side === s.side));
+  updateReviewProgress();
+  try { if (navigator.vibrate) navigator.vibrate(20); } catch { /* ignore */ }
+}
+
+// Minimal CSS.escape fallback for attribute selectors on song keys.
+function cssEscape(str) {
+  return String(str).replace(/["\\\]:#.]/g, '\\$&');
+}
+
+// Gestures: pinch-zoom (synced across both versions on wide screens), pan when
+// zoomed, horizontal swipe to switch version (narrow), vertical swipe/scroll to
+// change pairs. Selection is a plain click (wired on each option).
+function attachReviewGestures() {
+  if (!mcZoom) return;
+  const pager = mcZoomPager;
+  const pts = new Map();
+  let mode = null;                    // 'pinch' | 'pan' | 'drag' | null
+  let activeSide = null, activePage = null;
+  let startDist = 0, startZoom = 1, startPanX = 0, startPanY = 0, anchorX = 0, anchorY = 0;
+  let startX = 0, startY = 0, swipeDX = 0, swipeDY = 0, axis = null, moved = false;
+
+  // Resolve which side (Mine / From file) a pointer is over. We can't rely on
+  // event.target because the pager captures the pointer, which retargets
+  // pointermove/up/click to the pager itself. So we hit-test the option rects
+  // using the pointer's screen coordinates, falling back to event.target.
+  const curSide = (pg, target, clientX, clientY) => {
+    if (mcZoom.narrow) return pg.sides[pg.hIndex || 0];   // only one is visible
+    if (typeof clientX === 'number' && typeof clientY === 'number') {
+      const hit = pg.sides.find(s => {
+        const r = s.opt.getBoundingClientRect();
+        return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+      });
+      if (hit) return hit;
+    }
+    const optEl = target && target.closest && target.closest('.mc-page-opt');
+    if (optEl) { const s = pg.sides.find(x => x.opt === optEl); if (s) return s; }
+    return pg.sides[0];
+  };
+  const localTo = (s, x, y) => { const r = s.stage.getBoundingClientRect(); return { x: x - r.left, y: y - r.top }; };
+  // No-op: selection now happens on a real tap in endPointer, so we no longer
+  // suppress clicks after gestures (that used to add a small delay before you
+  // could choose a version right after scrolling/switching).
+  const armClickGuard = () => {};
+
+  pager.onpointerdown = (e) => {
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pg = mcZoom.pages[mcZoom.index];
+    activePage = pg;
+    startX = e.clientX; startY = e.clientY; swipeDX = 0; swipeDY = 0; axis = null; moved = false;
+
+    if (pts.size === 2) {
+      // Pinch-zoom the relevant side.
+      const [a, b] = [...pts.values()];
+      const s = curSide(pg, e.target, (a.x + b.x) / 2, (a.y + b.y) / 2);
+      activeSide = s;
+      startDist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      startZoom = s.zoom; startPanX = s.panX; startPanY = s.panY;
+      const mid = localTo(s, (a.x + b.x) / 2, (a.y + b.y) / 2);
+      anchorX = mid.x; anchorY = mid.y;
+      mode = 'pinch';
+      armClickGuard();
+      return;
+    }
+
+    // One finger.
+    activeSide = curSide(pg, e.target, e.clientX, e.clientY);
+    if (activeSide && activeSide.zoom > 1.01) {
+      startPanX = activeSide.panX; startPanY = activeSide.panY;
+      mode = 'pan';
+    } else {
+      mode = 'drag';
+      mcZoomPager.style.transition = 'none';
+      pg.pair.style.transition = 'none';
+    }
+    try { pager.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  };
+
+  pager.onpointermove = (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pg = activePage || mcZoom.pages[mcZoom.index];
+
+    if (mode === 'pinch' && pts.size >= 2 && activeSide) {
+      const s = activeSide;
+      const [a, b] = [...pts.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      const nz = Math.max(1, Math.min(5, startZoom * (dist / startDist)));
+      const cx = (anchorX - startPanX) / startZoom;
+      const cy = (anchorY - startPanY) / startZoom;
+      s.zoom = nz; s.panX = anchorX - cx * nz; s.panY = anchorY - cy * nz;
+      s.inner.style.transition = 'none';
+      applyReviewTransform(s);
+      if (!mcZoom.narrow) syncReviewZoom(pg, s);   // mirror on wide screens
+      armClickGuard();
+      return;
+    }
+
+    if (mode === 'pan' && activeSide) {
+      const s = activeSide;
+      s.panX = startPanX + (e.clientX - startX);
+      s.panY = startPanY + (e.clientY - startY);
+      s.inner.style.transition = 'none';
+      applyReviewTransform(s);
+      if (!mcZoom.narrow) syncReviewZoom(pg, s);
+      armClickGuard();
+      return;
+    }
+
+    if (mode === 'drag') {
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (Math.hypot(dx, dy) > 8) { moved = true; armClickGuard(); }
+      if (!axis && Math.hypot(dx, dy) > 12) {
+        // Horizontal only matters on narrow screens (switch version).
+        axis = (mcZoom.narrow && Math.abs(dx) > Math.abs(dy)) ? 'h' : 'v';
+      }
+      if (axis === 'h') {
+        swipeDX = dx;
+        // Track is 200% wide; % is of the track's own width. dx px = dx/W*100%.
+        const pct = (dx / (pg.pair.clientWidth || 1)) * 100;
+        pg.pair.style.transform = `translateX(${-(pg.hIndex || 0) * 50 + pct}%)`;
+      } else if (axis === 'v') {
+        swipeDY = dy;
+        const pct = (dy / (pager.clientHeight || 1)) * 100;
+        mcZoomPager.style.transform = `translateY(${-mcZoom.index * 100 + pct}%)`;
+      }
+    }
+  };
+
+  const endPointer = (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.delete(e.pointerId);
+    const pg = activePage || mcZoom.pages[mcZoom.index];
+
+    // A clean tap (no drag, no swipe, no pinch) selects the version under the
+    // pointer. We handle it here rather than via a child click listener because
+    // the pager captures the pointer, so the browser dispatches `click` to the
+    // pager and never to the .mc-page-opt child.
+    const wasTap = !moved && mode === 'drag' && !axis;
+
+    if (mode === 'drag' && axis === 'h') {
+      // clientWidth is the full 200% track, so one screen ≈ half of it.
+      const threshold = (pg.pair.clientWidth || 600) * 0.5 * 0.2;
+      let hi = pg.hIndex || 0;
+      if (swipeDX <= -threshold) hi++;
+      else if (swipeDX >= threshold) hi--;
+      snapPairVersion(pg, hi, true);
+    } else if (mode === 'drag' && axis === 'v') {
+      const threshold = (pager.clientHeight || 500) * 0.16;
+      let target = mcZoom.index;
+      if (swipeDY <= -threshold) target++;
+      else if (swipeDY >= threshold) target--;
+      snapToReviewPage(target, true);
+    } else if (wasTap && pts.size === 0) {
+      const s = curSide(pg, e.target, e.clientX, e.clientY);
+      if (s) selectReviewSide(pg, s);
+    }
+
+    if (pts.size === 0) { mode = null; activeSide = null; axis = null; }
+    else if (pts.size === 1) {
+      const [p] = [...pts.values()];
+      startX = p.x; startY = p.y; axis = null;
+      if (activeSide && activeSide.zoom > 1.01) { startPanX = activeSide.panX; startPanY = activeSide.panY; mode = 'pan'; }
+      else mode = 'drag';
+    }
+  };
+  pager.onpointerup = endPointer;
+  pager.onpointercancel = endPointer;
+
+  // Wheel handling:
+  //  - Ctrl/Cmd + wheel (laptop touchpad pinch => ctrlKey) zooms the side under
+  //    the cursor, anchored at the pointer, so pinch-to-zoom works on trackpads.
+  //  - When a side is already zoomed in, a plain wheel pans it (down = scroll
+  //    down the page) instead of flipping pairs.
+  //  - Otherwise a plain wheel snaps to the next/previous pair.
+  let wheelLastAt = 0;   // minimal debounce so one physical notch doesn't double-fire
+  pager.onwheel = (e) => {
+    e.preventDefault();
+    const pg = mcZoom.pages[mcZoom.index];
+
+    // Pinch-zoom (trackpad) or ctrl+wheel zoom.
+    if (e.ctrlKey || e.metaKey) {
+      const s = curSide(pg, e.target, e.clientX, e.clientY);
+      if (!s) return;
+      const p = localTo(s, e.clientX, e.clientY);
+      const cx = (p.x - s.panX) / s.zoom;
+      const cy = (p.y - s.panY) / s.zoom;
+      const nz = Math.max(1, Math.min(5, s.zoom * Math.exp(-e.deltaY * 0.0025)));
+      s.zoom = nz; s.panX = p.x - cx * nz; s.panY = p.y - cy * nz;
+      s.inner.style.transition = 'none';
+      applyReviewTransform(s);
+      if (!mcZoom.narrow) syncReviewZoom(pg, s);
+      armClickGuard();
+      return;
+    }
+
+    // Plain wheel while zoomed in: pan the zoomed side rather than flip pairs.
+    const zoomedSide = pg.sides.find(s => s.zoom > 1.01);
+    if (zoomedSide) {
+      zoomedSide.panX -= e.deltaX;
+      zoomedSide.panY -= e.deltaY;
+      zoomedSide.inner.style.transition = 'none';
+      applyReviewTransform(zoomedSide);
+      if (!mcZoom.narrow) syncReviewZoom(pg, zoomedSide);
+      return;
+    }
+
+    // Not zoomed: snap directly, no cooldown. A tiny 50ms debounce only stops a
+    // single physical notch from registering twice; it never makes you wait.
+    const dx = e.deltaX, dy = e.deltaY;
+    const now = e.timeStamp || performance.now();
+    if (now - wheelLastAt < 50) return;
+
+    // Narrow screens: a mostly-horizontal scroll snaps to the OTHER version of
+    // the current page (Mine <-> From file). Vertical still moves between pairs.
+    if (mcZoom.narrow && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= 2) {
+      wheelLastAt = now;
+      snapPairVersion(pg, (pg.hIndex || 0) + (dx > 0 ? 1 : -1), true);
+      return;
+    }
+
+    if (Math.abs(dy) < 2) return;   // ignore jitter / stray horizontal
+    wheelLastAt = now;
+    snapToReviewPage(mcZoom.index + (dy > 0 ? 1 : -1), true);
+  };
+
+  // (Double-tap-to-zoom was removed: it clashed with single-tap-to-select.
+  // Zoom is still available via pinch / ctrl+wheel.)
+}
+
+function closeConflictReview() {
+  mcZoomOverlay.classList.add('hidden');
+  mcZoomPager.innerHTML = '';
+  mcZoom = null;
+}
+mcZoomClose.addEventListener('click', closeConflictReview);
+document.addEventListener('keydown', (e) => {
+  if (mcZoomOverlay.classList.contains('hidden')) return;
+  if (e.key === 'Escape') { closeConflictReview(); return; }
+  if (!mcZoom) return;
+  const pg = mcZoom.pages[mcZoom.index];
+
+  if (e.key === 'ArrowDown') { e.preventDefault(); snapToReviewPage(mcZoom.index + 1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); snapToReviewPage(mcZoom.index - 1); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); focusReviewSide(pg, (pg.hIndex || 0) + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); focusReviewSide(pg, (pg.hIndex || 0) - 1); }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    const s = pg && pg.sides[pg.hIndex || 0];
+    if (s) selectReviewSide(pg, s);
+  }
+});
+
+// Move the "current version" focus (0 = Mine, 1 = From file). On narrow screens
+// this slides the horizontal track to show the version; on wide screens both
+// are visible, so it just moves a focus ring so Enter knows which to select.
+function focusReviewSide(pg, hi) {
+  if (!pg) return;
+  hi = Math.max(0, Math.min(pg.sides.length - 1, hi));
+  pg.hIndex = hi;
+  if (mcZoom && mcZoom.narrow) {
+    snapPairVersion(pg, hi, true);
+  }
+  // Reflect the focused side visually (works in both layouts).
+  pg.sides.forEach((o, i) => o.opt.classList.toggle('mc-page-opt--focused', i === hi));
 }
 
 // A human label for a conflicting song key, e.g. "Song 42" (+ title if known).
@@ -3617,7 +4212,7 @@ async function openMergeConflictResolver(filePath, existing, incoming) {
 
       const cap = document.createElement('div');
       cap.className = 'mc-option-cap';
-      const marks = (side === 'mine' ? c.existing || existing[c.key] : incoming[c.key]) || [];
+      const marks = (side === 'mine' ? existing[c.key] : incoming[c.key]) || [];
       cap.textContent = `${side === 'mine' ? 'Mine' : 'From file'} · ${marks.length} mark${marks.length === 1 ? '' : 's'}`;
       opt.appendChild(cap);
 
@@ -3632,7 +4227,12 @@ async function openMergeConflictResolver(filePath, existing, incoming) {
     block.appendChild(pair);
     mcList.appendChild(block);
 
-    // Render both previews (page can be null if we couldn't map the key).
+    // Long-press anywhere on the pair opens the full-screen reviewer starting
+    // at THIS pair. (A quick tap on an option still selects it via the click
+    // handler above.)
+    attachLongPress(block, () => openConflictReview(conflicts.indexOf(c)));
+
+    // Render both inline previews (page can be null if we couldn't map the key).
     if (c.page != null) {
       const [mineCanvas, fileCanvas] = await Promise.all([
         renderPagePreview(c.page, existing[c.key], 300),
@@ -3649,6 +4249,24 @@ async function openMergeConflictResolver(filePath, existing, incoming) {
   }
 
   mergeConflictDialog.classList.remove('hidden');
+}
+
+// Fire `cb` when the pointer is held on `el` for MC_HOLD_MS without much move.
+// Doesn't block the element's own click (used for quick option selection).
+function attachLongPress(el, cb) {
+  let timer = null, sx = 0, sy = 0;
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } el.classList.remove('mc-longpress'); };
+  el.addEventListener('pointerdown', (e) => {
+    sx = e.clientX; sy = e.clientY;
+    el.classList.add('mc-longpress');
+    timer = setTimeout(() => { timer = null; el.classList.remove('mc-longpress'); cb(); }, MC_HOLD_MS);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (timer && Math.hypot(e.clientX - sx, e.clientY - sy) > 10) clear();
+  });
+  el.addEventListener('pointerup', clear);
+  el.addEventListener('pointercancel', clear);
+  el.addEventListener('pointerleave', clear);
 }
 
 function closeMergeConflictResolver() {
@@ -3668,6 +4286,7 @@ function mcSetAll(side) {
 }
 mcAllMine.addEventListener('click', () => mcSetAll('mine'));
 mcAllFile.addEventListener('click', () => mcSetAll('file'));
+if (mcReviewBtn) mcReviewBtn.addEventListener('click', () => openConflictReview(0));
 mcCancelBtn.addEventListener('click', closeMergeConflictResolver);
 
 mcApplyBtn.addEventListener('click', async () => {
@@ -3738,67 +4357,36 @@ mmReplaceBtn.addEventListener('click', async () => {
 });
 
 // ---- Merge ----
+// Unified flow for desktop AND mobile: pick a JSON file (read-only), then show
+// the visual conflict resolver when merging into the open book (previews work),
+// otherwise fall back to a keep-mine merge.
 mmMergeBtn.addEventListener('click', async () => {
   const filePath = mmTargetPath;
   if (!filePath) return;
-  const priority = mmMergePriority;   // capture before dialog closes
   closeManageMarkupsDialog();
 
-  let incoming = null;
+  if (!window.api.loadAnnotationsFile) return;
 
-  if (MOBILE && window.api.importAnnotationsSidecar) {
-    // Mobile importAnnotationsSidecar always gives priority to existing — for
-    // "file wins" we use replaceAnnotationsFromFile on top of a manual merge.
-    if (priority === 'mine') {
-      const result = await window.api.importAnnotationsSidecar(filePath).catch(() => null);
-      if (!result || !result.success) return;
-    } else {
-      // "File wins": load existing, load incoming via file picker, file takes priority.
-      const result = await window.api.replaceAnnotationsFromFile(filePath).catch(() => null);
-      if (!result || !result.success) return;
-      // Re-read what was just written (the incoming data) and overlay existing.
-      const saved  = (await window.api.loadAnnotations(filePath).catch(() => null)) || {};
-      const before = (filePath === currentPdfPath) ? { ...annotations } : {};
-      const merged = priority === 'file'
-        ? { ...before, ...saved }    // saved (incoming) wins over old
-        : { ...saved, ...before };   // before (mine) wins — shouldn't reach here
-      if (filePath === currentPdfPath) {
-        annotations = merged;
-        migrateLegacyAnnotations();
-        rebuildSongKeyMap();
-        scheduleSave();
-      } else {
-        await window.api.saveAnnotations(filePath, merged);
-      }
-    }
-  } else if (window.api.loadAnnotationsFile) {
-    incoming = await window.api.loadAnnotationsFile().catch(() => null);
-    if (!incoming) return;
+  const incoming = await window.api.loadAnnotationsFile().catch(() => null);
+  if (!incoming) return;   // cancelled or invalid
 
-    // Load what's already on disk for this book.
-    const existing = (await window.api.loadAnnotations(filePath).catch(() => null)) || {};
+  // For the open book use the LIVE in-memory marks (may include unsaved edits);
+  // otherwise read from disk.
+  const existing = (filePath === currentPdfPath)
+    ? { ...annotations }
+    : ((await window.api.loadAnnotations(filePath).catch(() => null)) || {});
 
-    // If we're merging into the CURRENTLY OPEN book, we can render page
-    // previews — so show the visual conflict resolver (it applies + saves and
-    // handles the no-conflict fast path internally).
-    if (filePath === currentPdfPath && pdfDoc) {
-      await openMergeConflictResolver(filePath, existing, incoming);
-      return;   // resolver handles saving, reload, and the toast
-    }
-
-    // Otherwise (a different, unopened book — no PDF to preview) fall back to
-    // the priority-based merge.
-    const merged = priority === 'mine'
-      ? { ...incoming, ...existing }   // existing (mine) overwrites incoming
-      : { ...existing, ...incoming };  // incoming (file) overwrites existing
-    await window.api.saveAnnotations(filePath, merged);
+  // Merging into the currently open book -> visual resolver (it handles the
+  // no-conflict fast path, saving, reload, and the toast).
+  if (filePath === currentPdfPath && pdfDoc) {
+    await openMergeConflictResolver(filePath, existing, incoming);
+    return;
   }
 
-  // If it's the open book, reload into memory immediately.
-  if (filePath === currentPdfPath) {
-    await reloadAnnotationsQuiet();
-    redrawVisibleAnnotations();
-  }
+  // Fallback (shouldn't normally happen — Manage markups targets the open book):
+  // keep existing on conflict, pull in the rest.
+  const merged = { ...incoming, ...existing };
+  await applyMergedAnnotations(filePath, merged);
   showShareToast('Markups merged.');
 });
 

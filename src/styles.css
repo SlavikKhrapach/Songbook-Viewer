@@ -581,8 +581,14 @@ body.draw-mode .tap-zones { display: none; }
   z-index: 36;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
   transition: opacity 0.2s ease;
+  /* On a narrow screen the whole row of tools won't fit across the width, so
+     wrap the buttons onto more rows (right-aligned) instead of running off the
+     left edge where the last tools become unreachable. */
+  flex-wrap: wrap;
+  max-width: calc(100vw - 24px);
 }
 .draw-tools.hidden { display: none; }
 /* Fade the tools out while a stroke is actively being drawn. */
@@ -672,6 +678,11 @@ body.dark .color-text-preview { filter: invert(1) hue-rotate(180deg); }
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.2);
+  /* Never run past the bottom of the screen — scroll inside instead so every
+     control stays reachable on short screens (e.g. a phone in landscape). */
+  max-height: calc(100vh - 76px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .color-popover.hidden { display: none; }
 .pop-colors {
@@ -1352,6 +1363,9 @@ body.zoomed.draw-mode #viewer { cursor: crosshair; }
   display: flex;
   flex-direction: column;
   gap: 18px;
+  max-height: 90vh;          /* scroll inside on short screens */
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .manage-markups-title {
@@ -1549,13 +1563,17 @@ button.primary.danger:hover { background: #c01c1c; border-color: #c01c1c; }
   cursor: pointer;
   transition: border-color 0.12s ease, background 0.12s ease;
 }
-.mc-option:hover { border-color: var(--btn-border-hover); }
-.mc-option--chosen {
+/* Hover only affects options that aren't the chosen one, so hovering the
+   selected version never wipes out its accent border (which was confusing). */
+.mc-option:not(.mc-option--chosen):hover { border-color: var(--btn-border-hover); }
+.mc-option--chosen,
+.mc-option--chosen:hover {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 /* Preview holds the rendered page canvas (or a placeholder string). */
 .mc-preview {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1568,10 +1586,209 @@ button.primary.danger:hover { background: #c01c1c; border-color: #c01c1c; }
 }
 .mc-preview canvas {
   display: block;
-  max-width: 100%;
-  height: auto;
+  width: 100%;
+  height: auto;           /* preserve the page aspect ratio from the canvas attrs */
   border-radius: 6px;
 }
+/* Long-press to open the full-screen reviewer shows no visual feedback
+   (the accent outline was distracting). The class is still toggled by JS. */
+
+/* "Review in full screen" button in the resolver. */
+.mc-review-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  flex: 0 0 auto;
+}
+.mc-review-btn:hover { background: var(--btn-hover); border-color: var(--btn-border-hover); }
+.mc-review-btn svg { width: 18px; height: 18px; display: block; }
+
+/* ---------- Full-screen conflict reviewer (vertical snap-pager) ---------- */
+.mc-zoom-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(0, 0, 0, 0.92);
+  overflow: hidden;
+  touch-action: none;
+}
+.mc-zoom-overlay.hidden { display: none; }
+
+/* Single top row: progress · title · close, all on one line. */
+.mc-zoom-top {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  z-index: 3;
+}
+.mc-zoom-close {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: none;
+}
+.mc-zoom-close svg { width: 22px; height: 22px; display: block; }
+.mc-zoom-progress {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+}
+/* Title takes the middle and stays centered; truncates if too long. */
+.mc-zoom-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.mc-zoom-hint {
+  position: fixed;
+  bottom: 12px;
+  left: 0; right: 0;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 12px;
+  z-index: 3;
+  pointer-events: none;
+}
+.mc-zoom-loading { color: rgba(255, 255, 255, 0.8); padding: 40px; text-align: center; }
+
+/* Vertical pager: each .mc-page is one full screen; JS translateY snaps it. */
+.mc-zoom-pager {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  touch-action: none;      /* we own pan/pinch/swipe */
+  will-change: transform;
+}
+.mc-page {
+  flex: 0 0 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 56px 12px 34px;  /* clear the top bar (52px) and the bottom hint */
+  box-sizing: border-box;
+  gap: 8px;
+  overflow: hidden;   /* clip the 200%-wide narrow track to one screen */
+}
+/* Per-page title moved into the shared top bar (.mc-zoom-title). */
+.mc-page-title { display: none; }
+
+/* Landscape: both versions side by side, each fitted to its column. */
+.mc-page-pair {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+.mc-page-opt {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-radius: 12px;
+  padding: 6px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* Narrow screens: ONE version fills the width; the pair is a horizontal track
+   twice the width, holding two side-by-side slots. JS slides it by -50% to
+   switch versions (swipe/scroll left/right).
+   NOTE: the track itself is 200% wide and each option is 50% OF THE TRACK
+   (= one screen). Sliding uses translateX in % of the track's own width, so
+   one step is -50%. This is more reliable than 100%-wide flex children, which
+   overflowed instead of forming a real 2-screen track. */
+.mc-narrow .mc-page-pair {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 0;
+  width: 200%;
+  overflow: visible;
+  will-change: transform;
+}
+.mc-narrow .mc-page-opt {
+  flex: 0 0 50%;
+  width: 50%;
+}
+.mc-page-opt--chosen { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+/* Keyboard focus ring (which version Enter will choose). Distinct from the
+   accent "chosen" state so you can tell focus from selection. */
+.mc-page-opt--focused { border-color: rgba(255, 255, 255, 0.85); }
+.mc-page-opt--focused.mc-page-opt--chosen { border-color: var(--accent); }
+
+/* Stage clips the zoomable page; inner gets the transform (origin 0,0). */
+.mc-page-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+.mc-page-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.mc-page-inner canvas {
+  display: block;
+  /* The fitted display size is computed in JS (measureReviewSide) from the
+     canvas's natural size and the stage size, so the WHOLE page is always
+     visible (letterboxed) and never cropped. Width/height are set inline. */
+  border-radius: 4px;
+  background: #fff;
+}
+.mc-page-cap {
+  flex: 0 0 auto;
+  text-align: center;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+}
+.mc-page-opt--chosen .mc-page-cap { color: var(--accent); }
+.mc-page-opt--chosen .mc-page-cap::before { content: "✓ "; font-weight: 700; }
+
+/* Each version is clickable to select it. */
+.mc-page-opt { cursor: pointer; }
 .mc-option-cap {
   font-size: 12px;
   font-weight: 500;

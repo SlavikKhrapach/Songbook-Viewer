@@ -291,6 +291,24 @@ if (!window.api) {
       });
     },
 
+    // Open a JSON picker and RETURN the parsed annotations (without writing
+    // anything). Mirrors the desktop 'loadAnnotationsFile' so the shared merge
+    // flow — including the visual conflict resolver — works on mobile too.
+    // Resolves to the parsed object, or null if cancelled/invalid.
+    loadAnnotationsFile() {
+      return new Promise((resolve) => {
+        jsonResolve = async (file) => {
+          if (!file) { resolve(null); return; }
+          try {
+            const data = JSON.parse(await file.text());
+            if (!data || typeof data !== 'object' || Array.isArray(data)) { resolve(null); return; }
+            resolve(data);
+          } catch { resolve(null); }
+        };
+        jsonInput.click();
+      });
+    },
+
     async clearAnnotations(slug) {
       try { await writeJson(`${META_DIR}/${slug}.json`, {}); return true; }
       catch (err) { console.error('clearAnnotations failed', err); return false; }
