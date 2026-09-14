@@ -423,6 +423,9 @@ body.dark #themeBtn .icon-sun { display: block; }
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.22);
   z-index: 40;
   overflow: hidden;
+  /* Glide up/down with the keyboard rather than snapping (bottom is set from
+     JS in adjustSearchForKeyboard as the visual viewport changes). */
+  transition: bottom 0.18s ease;
 }
 .search-panel.dock-right { left: auto; right: 16px; }
 .search-panel.hidden { display: none; }
@@ -994,6 +997,24 @@ body.zoomed.draw-mode #viewer { cursor: crosshair; }
 @keyframes library-slide-in {
   from { transform: translateX(100%); opacity: 0; }
   to   { transform: translateX(0);    opacity: 1; }
+}
+
+/* Closing: mirror the open animation — panel slides back out to the right and
+   the dim backdrop fades away. The overlay keeps `.closing` for the duration,
+   then `closeLibrary()` adds `.hidden` once the animation ends. */
+.library-overlay.closing {
+  animation: library-backdrop-out 0.22s ease forwards;
+}
+.library-overlay.closing .library-panel {
+  animation: library-slide-out 0.22s ease forwards;
+}
+@keyframes library-slide-out {
+  from { transform: translateX(0);    opacity: 1; }
+  to   { transform: translateX(100%); opacity: 0; }
+}
+@keyframes library-backdrop-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
 }
 
 /* Header row: title + close button */

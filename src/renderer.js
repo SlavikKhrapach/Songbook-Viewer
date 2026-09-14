@@ -26,7 +26,14 @@ let viewH = 0;                 // usable viewport height
 let fullCache = new Map();     // page number -> full-res canvas (LRU by insert order)
 let titleCache = new Map();    // page number -> extracted song title (string)
 let langByPage = new Map();    // page number -> 'ru' | 'en' (by script detection)
+let blankByPage = new Map();   // page number -> true if the page has no text (blank)
 let sweepJob = 0;              // cancels the background title sweep on reload
+
+// Whether to hop over blank/empty pages when turning pages or scrubbing. Blank
+// pages are detected during indexing (no extractable text) and remembered in
+// the saved index. Navigation lands on the next NON-blank page in the travel
+// direction; explicit jumps (search) still go exactly where asked.
+const SKIP_BLANK_PAGES = true;
 
 const FULL_BUFFER = 3;         // pages of full-res to eagerly render each side
 
@@ -209,6 +216,7 @@ async function loadPdf(data, name, filePath) {
   currentPage = 1;
   titleCache.clear();   // fresh document -> discard old titles
   langByPage.clear();
+  blankByPage.clear();
 
   // Load saved annotations for this document (keyed by its path).
   currentPdfPath = filePath || name || null;
@@ -257,13 +265,24 @@ async function indexBook(token) {
       const cached = await window.api.loadIndex(currentPdfPath);
       if (token !== renderToken) return;
       if (cached && cached.pageCount === total && cached.titles && cached.langs) {
+        // Trust cached blank flags only if they were computed by the CURRENT
+        // detection rule. Older/absent versions get recomputed below so a
+        // sharper rule takes effect without a full re-index.
+        const blanksFresh = cached.blanks && cached.blankVersion === BLANK_DETECT_VERSION;
         for (let n = 1; n <= total; n++) {
           if (cached.titles[n] !== undefined) titleCache.set(n, cached.titles[n]);
           if (cached.langs[n] !== undefined) langByPage.set(n, cached.langs[n]);
+          if (blanksFresh && cached.blanks[n] !== undefined) blankByPage.set(n, cached.blanks[n]);
         }
         rebuildSongKeyMap();
         redrawVisibleAnnotations();
-        return; // cache hit — no extraction needed
+        // Collapse known blanks out of the view now that the content list is
+        // built from the cached flags.
+        refreshContentLayout();
+        // Missing or stale blank data: recompute quietly in the background (no
+        // toast) so page-skipping works without forcing a visible re-index.
+        if (!blanksFresh) backfillBlanks(token, job);
+        return; // cache hit — titles/langs already loaded
       }
     } catch { /* fall through to fresh index */ }
   }
@@ -286,21 +305,71 @@ async function indexBook(token) {
     if (!titleCache.has(n)) await extractTitle(n);
     done++;
     if (n % 5 === 0 || n === total) updateIndexToast(done, total);
-    if (n % 25 === 0) { rebuildSongKeyMap(); redrawVisibleAnnotations(); }
+    if (n % 25 === 0) { rebuildSongKeyMap(); redrawVisibleAnnotations(); refreshContentLayout(); }
   }
   rebuildSongKeyMap();
   redrawVisibleAnnotations();
+  refreshContentLayout();
   hideIndexToast();
 
   // 3) Save the index for next time.
   if (window.api.saveIndex && currentPdfPath) {
     const titles = {};
     const langs = {};
+    const blanks = {};
     for (let n = 1; n <= total; n++) {
       if (titleCache.has(n)) titles[n] = titleCache.get(n);
       if (langByPage.has(n)) langs[n] = langByPage.get(n);
+      if (blankByPage.has(n)) blanks[n] = blankByPage.get(n);
     }
-    window.api.saveIndex(currentPdfPath, { pageCount: total, titles, langs });
+    window.api.saveIndex(currentPdfPath, { pageCount: total, titles, langs, blanks, blankVersion: BLANK_DETECT_VERSION });
+  }
+}
+
+// Backfill blank-page flags for a book whose saved index predates blank
+// detection. Runs quietly in the background (no toast), classifying each page
+// by whether it has any extractable text, then re-saves the index so the work
+// is only done once. Yields between pages to keep the UI responsive.
+async function backfillBlanks(token, job) {
+  const total = pdfDoc.numPages;
+  let found = 0;
+  for (let n = 1; n <= total; n++) {
+    if (job !== sweepJob || token !== renderToken) return;   // reload/relayout cancels
+    if (blankByPage.has(n)) continue;
+    try {
+      const page = await pdfDoc.getPage(n);
+      if (token !== renderToken) return;
+      const content = await page.getTextContent();
+      if (token !== renderToken) return;
+      let allText = '';
+      for (const item of content.items) allText += item.str || '';
+      const blank = isBlankText(allText);
+      blankByPage.set(n, blank);
+      if (blank) found++;
+    } catch {
+      blankByPage.set(n, false);   // couldn't read -> don't skip it
+    }
+    // Periodically collapse newly-found blanks out of the live view so the
+    // change is gradual, not a single jump when the whole sweep finishes.
+    if (found && n % 20 === 0) refreshContentLayout();
+    await new Promise(r => setTimeout(r, 0));
+  }
+  if (job !== sweepJob || token !== renderToken) return;
+
+  // Final collapse so any trailing blanks disappear from the view + scrubber.
+  refreshContentLayout();
+
+  // Persist the enriched index (titles/langs already present) with blanks now.
+  if (window.api.saveIndex && currentPdfPath) {
+    const titles = {};
+    const langs = {};
+    const blanks = {};
+    for (let n = 1; n <= total; n++) {
+      if (titleCache.has(n)) titles[n] = titleCache.get(n);
+      if (langByPage.has(n)) langs[n] = langByPage.get(n);
+      if (blankByPage.has(n)) blanks[n] = blankByPage.get(n);
+    }
+    window.api.saveIndex(currentPdfPath, { pageCount: total, titles, langs, blanks, blankVersion: BLANK_DETECT_VERSION });
   }
 }
 
@@ -371,10 +440,14 @@ async function ensureDiskCached(n, token) {
   canvas.width = 0; canvas.height = 0;
 }
 
-// Redraw annotations on the currently visible page(s).
+// Redraw annotations on the currently visible page(s). In 2-up the second
+// visible page is the next CONTENT page, not necessarily currentPage + 1.
 function redrawVisibleAnnotations() {
   redrawAnnotations(currentPage);
-  if (viewCount > 1) redrawAnnotations(currentPage + 1);
+  if (viewCount > 1) {
+    const right = contentPages[contentIndexForPage(currentPage) + 1];
+    if (right) redrawAnnotations(right);
+  }
 }
 
 // Extract the song title from a page's text: the FIRST (topmost) line.
@@ -389,6 +462,13 @@ async function extractTitle(n) {
     let allText = '';
     for (const item of content.items) allText += item.str || '';
     langByPage.set(n, detectLang(allText));
+
+    // Decide whether the page is blank/empty. A truly empty text layer is the
+    // obvious case, but many "blank" separator pages still carry a little noise:
+    // a page number, a running header/footer, or a stray glyph. So we count only
+    // MEANINGFUL characters (letters/digits, Latin + Cyrillic) and treat a page
+    // with almost none as blank. See isBlankText() for the threshold.
+    blankByPage.set(n, isBlankText(allText));
 
     // Group text items into lines by their vertical position.
     const lines = new Map(); // roundedY -> { y, text, xMin }
@@ -420,6 +500,9 @@ async function extractTitle(n) {
     }
   } catch {
     title = '';
+    // Failed to read the page — don't treat it as blank (never skip a page we
+    // simply couldn't parse).
+    if (!blankByPage.has(n)) blankByPage.set(n, false);
   }
 
   title = cleanTitle(title);
@@ -433,6 +516,26 @@ function cleanTitle(s) {
   s = s.replace(/\s+/g, ' ').trim();
   if (s.length > 60) s = s.slice(0, 57) + '…';
   return s;
+}
+
+// The most letters/digits a page can have and still count as "blank". A truly
+// empty page has 0; a separator page that carries only a page number or a short
+// running header/footer has a handful. Real content pages (song number + title
+// + lyrics) have far more, so a low threshold cleanly separates the two without
+// risking a content page being skipped.
+const BLANK_TEXT_MAX_CHARS = 3;
+
+// Bumped whenever the blank-detection rule changes, so a book indexed under an
+// older rule recomputes its blank flags instead of trusting stale ones.
+const BLANK_DETECT_VERSION = 2;
+
+// Whether a page's extracted text is "blank enough" to skip. Counts only
+// meaningful glyphs — Latin/Cyrillic letters and digits — ignoring whitespace,
+// punctuation, and layout artifacts. A page number like "12" (2 chars) still
+// reads as blank; a title line does not.
+function isBlankText(text) {
+  const meaningful = (String(text || '').match(/[\p{L}\p{N}]/gu) || []).length;
+  return meaningful <= BLANK_TEXT_MAX_CHARS;
 }
 
 // Classify a page's language by script: any meaningful Cyrillic => Russian.
@@ -534,10 +637,11 @@ async function layout(token) {
 
 // Keep currentPage within a range that leaves a full window when possible.
 function clampCurrentPage() {
-  const total = pdfDoc.numPages;
-  const maxStart = Math.max(1, total - viewCount + 1);
-  if (currentPage > maxStart) currentPage = maxStart;
-  if (currentPage < 1) currentPage = 1;
+  // Snap onto the content list and bound to a full window of content pages, so
+  // currentPage is always a real (non-blank) page we can actually show.
+  let ci = contentIndexForPage(currentPage);
+  ci = Math.min(maxContentStart(), Math.max(0, ci));
+  currentPage = pageForContentIndex(ci);
 }
 
 // Render a single page at full resolution (cached in fullCache). Uses the
@@ -684,6 +788,9 @@ function fillSlotIfEmpty(n) {
 //   Russian song 42 -> "s42:ru:0"
 // Pages before the first detected song (front matter) fall back to "p<page>".
 function rebuildSongKeyMap() {
+  // The content-page list (blanks collapsed out) is derived from the same page
+  // classification, so refresh it whenever the song map rebuilds.
+  rebuildContentPages();
   songKeyByPage = new Map();
   songStartPages = new Map();   // page -> clean song number, ONLY for real starts
   if (!pdfDoc) return;
@@ -1059,10 +1166,13 @@ function closeTextEditor(commit) {
     }
     const item = { type: 'text', x: ed.fx, y: ed.fy, text, color: ed.color, size: ed.size, weight: ed.weight, w, h };
     if (ed.editIndex >= 0) {
-      // Editing an existing note: put the new version back in its place. Undo
-      // restores the ORIGINAL note (stored on the action) at that index.
-      arr.splice(ed.editIndex, 0, item);
-      pushUndo({ type: 'edit', key: ed.key, index: ed.editIndex, before: ed.original, after: item });
+      // Editing an existing note: the note was pulled out of the array while
+      // editing, so re-add the new version at the TOP (end of the array). The
+      // thing you most recently touched should sit above everything else. Undo
+      // restores the ORIGINAL note at its ORIGINAL index.
+      const newIndex = arr.length;
+      arr.push(item);
+      pushUndo({ type: 'reorderEdit', key: ed.key, oldIndex: ed.editIndex, newIndex, before: ed.original, after: item });
     } else {
       arr.push(item);
       pushUndo({ type: 'add', key: ed.key, page: ed.n, stroke: item });
@@ -1362,14 +1472,17 @@ function attachDrawing(canvas, n) {
       // A note was dragged: drop it at the new position (undoable move).
       if (pend.dragging && pend.existing) {
         const arr = annotations[pend.key] || (annotations[pend.key] = []);
-        const idx = Math.min(pend.existingIndex, arr.length);
         if (e.type === 'pointerup' && pend.liveItem) {
+          // A dragged note is the thing you most recently touched: drop it at
+          // the TOP (end of the array) so it renders above other annotations.
           const moved = { ...pend.existing, x: pend.liveItem.x, y: pend.liveItem.y };
-          arr.splice(idx, 0, moved);
-          pushUndo({ type: 'edit', key: pend.key, index: idx, before: pend.existing, after: moved });
+          const newIndex = arr.length;
+          arr.push(moved);
+          pushUndo({ type: 'reorderEdit', key: pend.key, oldIndex: pend.existingIndex, newIndex, before: pend.existing, after: moved });
           scheduleSave();
         } else {
-          // Cancelled mid-drag: put the note back untouched.
+          // Cancelled mid-drag: put the note back untouched at its old index.
+          const idx = Math.min(pend.existingIndex, arr.length);
           arr.splice(idx, 0, pend.existing);
         }
         redrawAnnotations(n);
@@ -1423,23 +1536,36 @@ function attachDrawing(canvas, n) {
 // Build the filmstrip: a slot per page, each slotWidth wide, no gaps.
 // We render the visible window plus one buffer page each side for smooth slides.
 async function ensureWindowRendered(token) {
-  const total = pdfDoc.numPages;
-  const first = Math.max(1, currentPage - FULL_BUFFER);
-  const last = Math.min(total, currentPage + viewCount - 1 + FULL_BUFFER);
+  const count = contentCount();
+  const curCi = contentIndexForPage(currentPage);
+  const firstCi = Math.max(0, curCi - FULL_BUFFER);
+  const lastCi = Math.min(count - 1, curCi + viewCount - 1 + FULL_BUFFER);
 
-  track.style.width = `${slotWidth * total}px`;
+  // The track spans only the CONTENT pages, positioned contiguously — blank
+  // pages take up no space, so they're effectively not in the document.
+  track.style.width = `${slotWidth * count}px`;
 
-  // 1) Create slots and immediately show the best tier available (thumb or
-  //    full). This guarantees no blank pages, even while scrubbing fast.
-  for (let n = first; n <= last; n++) {
+  // Real page numbers for the window, and a quick lookup of which pages are in
+  // it (used for eviction below).
+  const windowPages = [];
+  for (let ci = firstCi; ci <= lastCi; ci++) windowPages.push(contentPages[ci]);
+  const inWindow = new Set(windowPages);
+
+  // 1) Create slots (positioned by CONTENT index, not raw page number) and show
+  //    the best tier available immediately so there's never a visible gap.
+  for (let ci = firstCi; ci <= lastCi; ci++) {
+    const n = contentPages[ci];
     let slot = track.querySelector(`.slot[data-slot="${n}"]`);
     if (!slot) {
       slot = document.createElement('div');
       slot.className = 'slot';
       slot.dataset.slot = String(n);
       slot.style.width = `${slotWidth}px`;
-      slot.style.left = `${slotWidth * (n - 1)}px`;
+      slot.style.left = `${slotWidth * ci}px`;   // contiguous content layout
       track.appendChild(slot);
+    } else {
+      // Keep the slot's position in sync if the content list changed.
+      slot.style.left = `${slotWidth * ci}px`;
     }
     if (!slot.firstChild) {
       const best = bestCanvasFor(n);
@@ -1449,27 +1575,32 @@ async function ensureWindowRendered(token) {
 
   alignPair();
 
-  // Drop DOM slots far outside the visible window to keep the DOM light. The
-  // in-memory canvas LRU manages its own eviction, so we don't touch it here.
+  // Drop DOM slots outside the visible window to keep the DOM light.
   track.querySelectorAll('.slot').forEach((slot) => {
     const n = Number(slot.dataset.slot);
-    if (n < first || n > last) slot.remove();
+    if (!inWindow.has(n)) slot.remove();
   });
 
   // 2) Render the buffered range (nearest first): from RAM if present, else a
   //    fast disk read, else PDF.js. Swap each into its slot when ready.
+  const visiblePages = [];
+  for (let i = 0; i < viewCount; i++) {
+    const p = contentPages[curCi + i];
+    if (p) visiblePages.push(p);
+  }
   const nearestFirst = [];
   for (let d = 0; d <= FULL_BUFFER + viewCount; d++) {
-    if (currentPage + d <= last) nearestFirst.push(currentPage + d);
-    if (d > 0 && currentPage - d >= first) nearestFirst.push(currentPage - d);
+    if (curCi + d <= lastCi) nearestFirst.push(contentPages[curCi + d]);
+    if (d > 0 && curCi - d >= firstCi) nearestFirst.push(contentPages[curCi - d]);
   }
   (async () => {
     for (const n of nearestFirst) {
       if (token !== renderToken) return;
+      if (!n) continue;
       // Visible pages (currently on screen) get the full device DPR for maximum
       // sharpness. Buffer pages use the standard RENDER_DPR to keep memory and
       // disk cache bounded.
-      const isVisible = n >= currentPage && n < currentPage + viewCount;
+      const isVisible = visiblePages.includes(n);
       const pageDpr = isVisible ? DPR : RENDER_DPR;
       const inMem = cacheGet(n);
       if (inMem) {
@@ -1491,11 +1622,12 @@ async function ensureWindowRendered(token) {
 // Left page of the pair hugs the right edge of its slot; right page hugs the
 // left edge of its slot. Every other slot centers its page.
 function alignPair() {
+  const rightPage = contentPages[contentIndexForPage(currentPage) + 1];
   track.querySelectorAll('.slot').forEach((slot) => {
     const n = Number(slot.dataset.slot);
     if (viewCount > 1 && n === currentPage) {
       slot.style.justifyContent = 'flex-end';   // left page -> right edge
-    } else if (viewCount > 1 && n === currentPage + 1) {
+    } else if (viewCount > 1 && n === rightPage) {
       slot.style.justifyContent = 'flex-start';  // right page -> left edge
     } else {
       slot.style.justifyContent = 'center';
@@ -1601,7 +1733,8 @@ function currentPageWidth() {
 // Position the filmstrip: pagination offset composed with zoom scale + pan.
 function positionTrack(animate) {
   track.style.transition = (animate && !zoomAnimating) ? 'transform 0.28s ease' : 'none';
-  const baseX = -slotWidth * (currentPage - 1);
+  // Pagination offset is measured in CONTENT-page slots (blanks collapsed out).
+  const baseX = -slotWidth * contentIndexForPage(currentPage);
   clampPan();
   track.style.transformOrigin = '0 0';
   track.style.transform =
@@ -1682,14 +1815,94 @@ function updateZoomUi() {
   scrubber.classList.toggle('hidden-bar', zoomed || chromeHidden);
 }
 
-// ---------- Navigation (shift by ONE page) ----------
-async function goToPage(n, animate = true) {
+// ---------- Blank pages: collapse them out of the view entirely ----------
+// A page is blank once we've indexed it AND found (almost) no text. Pages not
+// yet classified are treated as NOT blank, so nothing gets hidden while
+// indexing is still in flight.
+function isBlankPage(n) {
+  return SKIP_BLANK_PAGES && blankByPage.get(n) === true;
+}
+
+// The ordered list of CONTENT (non-blank) PDF page numbers, and a reverse map
+// from a real page number to its position in that list. Rebuilt from
+// blankByPage whenever the blank set changes (after indexing/backfill). Blank
+// pages are simply absent, so the filmstrip, scrubber, and page turns behave as
+// if the document contained only these pages.
+let contentPages = [];               // e.g. [1, 2, 4, 5, 8, ...]
+let contentIndexByPage = new Map();  // pageNumber -> index into contentPages
+
+function rebuildContentPages() {
+  contentPages = [];
+  contentIndexByPage = new Map();
   if (!pdfDoc) return;
   const total = pdfDoc.numPages;
-  const maxStart = Math.max(1, total - viewCount + 1);
-  n = Math.min(maxStart, Math.max(1, n));
-  if (n === currentPage) return;
-  currentPage = n;
+  for (let n = 1; n <= total; n++) {
+    if (!isBlankPage(n)) {
+      contentIndexByPage.set(n, contentPages.length);
+      contentPages.push(n);
+    }
+  }
+  // Safety net: a document detected as "all blank" (shouldn't happen) keeps
+  // every page so the viewer never ends up empty.
+  if (contentPages.length === 0) {
+    for (let n = 1; n <= total; n++) {
+      contentIndexByPage.set(n, contentPages.length);
+      contentPages.push(n);
+    }
+  }
+}
+
+// How many content pages exist (the effective document length).
+function contentCount() { return contentPages.length || pdfDoc.numPages; }
+
+// Recompute the content list and re-lay the filmstrip/scrubber so any blanks
+// discovered after the initial layout (background backfill) collapse out of the
+// view. currentPage stays on a content page, so the reader doesn't jump.
+function refreshContentLayout() {
+  if (!pdfDoc || !viewer.clientWidth) return;
+  rebuildContentPages();
+  clampCurrentPage();
+  ensureWindowRendered(renderToken);
+  positionTrack(false);
+  if (!isScrubbing) updateScrubber();
+}
+
+// Content-list index for a real page. Before the list is built (during first
+// load, pre-indexing) fall back to raw page order so pagination still works.
+// If the page itself is blank, snap to the nearest content page before it.
+function contentIndexForPage(n) {
+  if (!contentPages.length) return Math.max(0, n - 1);   // raw fallback
+  if (contentIndexByPage.has(n)) return contentIndexByPage.get(n);
+  for (let p = n - 1; p >= 1; p--) if (contentIndexByPage.has(p)) return contentIndexByPage.get(p);
+  for (let p = n + 1; p <= pdfDoc.numPages; p++) if (contentIndexByPage.has(p)) return contentIndexByPage.get(p);
+  return 0;
+}
+
+// Real page number for a content-list index (clamped). Raw fallback before the
+// content list is built.
+function pageForContentIndex(i) {
+  if (!contentPages.length) return Math.min(pdfDoc.numPages, Math.max(1, i + 1));
+  const c = Math.min(contentPages.length - 1, Math.max(0, i));
+  return contentPages[c];
+}
+
+// The largest content index that can be the LEFT page of the view, leaving a
+// full window (viewCount) of content pages visible.
+function maxContentStart() {
+  return Math.max(0, contentCount() - viewCount);
+}
+
+// ---------- Navigation (shift by ONE content page) ----------
+// `n` is a real PDF page number. It's snapped onto the content list so blank
+// pages are never a destination. maxStart is expressed in content terms so the
+// last window shows a full set of content pages.
+async function goToPage(n, animate = true) {
+  if (!pdfDoc) return;
+  let ci = contentIndexForPage(Math.max(1, Math.min(pdfDoc.numPages, n)));
+  ci = Math.min(maxContentStart(), Math.max(0, ci));
+  const target = pageForContentIndex(ci);
+  if (target === currentPage) return;
+  currentPage = target;
   // Flipping to a different page resets any zoom so each page starts at fit.
   if (isZoomed()) resetZoom(false);
   await ensureWindowRendered(renderToken);
@@ -1697,14 +1910,22 @@ async function goToPage(n, animate = true) {
   if (!isScrubbing) updateScrubber();
 }
 
-function next() { goToPage(currentPage + 1); }      // one page leaves, one enters
-function prev() { goToPage(currentPage - 1); }
+// Step by one CONTENT page (blank pages don't exist in this sequence).
+function goByContent(delta, animate = true) {
+  const ci = contentIndexForPage(currentPage) + delta;
+  goToPage(pageForContentIndex(Math.min(maxContentStart(), Math.max(0, ci))), animate);
+}
+function next() { goByContent(+1); }   // one content page leaves, one enters
+function prev() { goByContent(-1); }
 
 // ---------- Scrubber ----------
+// The scrubber runs across CONTENT pages only, so blank pages take up no room
+// on the bar and can never be scrubbed to.
 function updateScrubber() {
   if (!pdfDoc) return;
-  const total = pdfDoc.numPages;
-  const pct = total <= 1 ? 0 : (currentPage - 1) / (total - 1);
+  const count = contentCount();
+  const ci = contentIndexForPage(currentPage);
+  const pct = count <= 1 ? 0 : ci / (count - 1);
   const trackW = scrubTrack.clientWidth;
   scrubFill.style.width = `${pct * 100}%`;
   scrubThumb.style.left = `${pct * trackW}px`;
@@ -1714,8 +1935,9 @@ function pageFromClientX(clientX) {
   const rect = scrubTrack.getBoundingClientRect();
   let pct = (clientX - rect.left) / rect.width;
   pct = Math.min(1, Math.max(0, pct));
-  const total = pdfDoc.numPages;
-  return Math.round(pct * (total - 1)) + 1;
+  const count = contentCount();
+  const ci = Math.round(pct * (count - 1));
+  return pageForContentIndex(ci);
 }
 
 function positionThumbAt(pct) {
@@ -1828,32 +2050,40 @@ function showThumb(n, result) {
 
 function handleScrub(clientX) {
   if (!pdfDoc) return;
-  const page = pageFromClientX(clientX);
-  const total = pdfDoc.numPages;
-  const pct = total <= 1 ? 0 : (page - 1) / (total - 1);
+  const page = pageFromClientX(clientX);   // already a content page
+  const count = contentCount();
+  const ci = contentIndexForPage(page);
+  const pct = count <= 1 ? 0 : ci / (count - 1);
   positionThumbAt(pct);
   updateScrubBubble(page, pct);
 
   if (page === currentPage) return;
   currentPage = page;
-  clampCurrentPage();
   positionTrack(false);
 
   // Cancel any previous in-flight thumbnail and start a new one.
   scrubThumbToken++;
   const token = scrubThumbToken;
+  const curCi = ci;
+  const keepLoCi = curCi - FULL_BUFFER;
+  const keepHiCi = curCi + viewCount - 1 + FULL_BUFFER;
+  const keepPages = new Set();
+  for (let c = keepLoCi; c <= keepHiCi; c++) {
+    if (contentPages[c]) keepPages.add(contentPages[c]);
+  }
   (async () => {
-    // Ensure the slot exists for this page (and viewCount partner if landscape).
+    // Ensure the slot exists for the visible content page(s), laid out by
+    // content index so blanks leave no gap.
     for (let i = 0; i < viewCount; i++) {
-      const n = currentPage + i;
-      if (n < 1 || n > total) continue;
+      const n = contentPages[curCi + i];
+      if (!n) continue;
       let slot = track.querySelector(`.slot[data-slot="${n}"]`);
       if (!slot) {
         slot = document.createElement('div');
         slot.className = 'slot';
         slot.dataset.slot = String(n);
         slot.style.width = `${slotWidth}px`;
-        slot.style.left = `${slotWidth * (n - 1)}px`;
+        slot.style.left = `${slotWidth * (curCi + i)}px`;
         track.appendChild(slot);
       }
       // If a full-res canvas is already cached for this page, use it directly.
@@ -1865,12 +2095,10 @@ function handleScrub(clientX) {
       if (thumb) showThumb(n, thumb);
     }
     alignPair();
-    // Keep the DOM light: remove slots more than FULL_BUFFER pages from view.
-    const keepLo = currentPage - FULL_BUFFER;
-    const keepHi = currentPage + viewCount - 1 + FULL_BUFFER;
+    // Keep the DOM light: remove slots outside the buffered content window.
     track.querySelectorAll('.slot').forEach(slot => {
       const n = Number(slot.dataset.slot);
-      if (n < keepLo || n > keepHi) slot.remove();
+      if (!keepPages.has(n)) slot.remove();
     });
   })();
 
@@ -1912,7 +2140,8 @@ function endScrub() {
   isScrubbing = false;
   scrubTrack.classList.remove('grabbing');
   hideScrubBubble();
-  // Scrubber released — load full-quality pages for the landed position.
+  // Scrubber released — load full-quality pages for the landed position. The
+  // scrubber only ever lands on content pages, so there's nothing to snap.
   triggerQualitySettle();
 }
 scrubTrack.addEventListener('pointerup', endScrub);
@@ -2809,7 +3038,10 @@ function removeStrokeAt(key, index, page) {
 // Redraw whichever visible page currently maps to a given song key.
 function redrawKeyIfVisible(key) {
   const pages = [currentPage];
-  if (viewCount > 1) pages.push(currentPage + 1);
+  if (viewCount > 1) {
+    const right = contentPages[contentIndexForPage(currentPage) + 1];
+    if (right) pages.push(right);
+  }
   for (const n of pages) {
     if (songKeyForPage(n) === key) redrawAnnotations(n);
   }
@@ -2839,6 +3071,18 @@ function undoStroke() {
     // Undo a text-note edit: swap the edited note back to its previous version.
     const arr = annotations[action.key];
     if (arr && action.index < arr.length) arr[action.index] = action.before;
+    redoStack.push(action);
+    redrawKeyIfVisible(action.key);
+  } else if (action.type === 'reorderEdit') {
+    // Undo an edit/drag that moved a note to the top: pull the edited version
+    // off the top and restore the ORIGINAL note at its original index.
+    const arr = annotations[action.key];
+    if (arr) {
+      const at = (action.newIndex < arr.length) ? action.newIndex : arr.length - 1;
+      if (at >= 0) arr.splice(at, 1);
+      const oldIdx = Math.min(action.oldIndex, arr.length);
+      arr.splice(oldIdx, 0, action.before);
+    }
     redoStack.push(action);
     redrawKeyIfVisible(action.key);
   } else if (action.type === 'clear') {
@@ -2876,6 +3120,18 @@ function redoStroke() {
     if (arr && action.index < arr.length) arr[action.index] = action.after;
     undoStack.push(action);
     redrawKeyIfVisible(action.key);
+  } else if (action.type === 'reorderEdit') {
+    // Redo an edit/drag: remove the original from its old index and re-add the
+    // edited version at the TOP.
+    const arr = annotations[action.key];
+    if (arr) {
+      const oldIdx = arr.indexOf(action.before);
+      if (oldIdx >= 0) arr.splice(oldIdx, 1);
+      else if (action.oldIndex < arr.length) arr.splice(action.oldIndex, 1);
+      arr.push(action.after);
+    }
+    undoStack.push(action);
+    redrawKeyIfVisible(action.key);
   } else if (action.type === 'clear') {
     // Re-apply the clear: remove the keys it originally cleared.
     for (const key of Object.keys(action.snapshot)) {
@@ -2891,7 +3147,10 @@ function clearCurrentPage() {
   // Clear only the last page the user interacted with. If none yet (or it's
   // no longer visible), fall back to the left/only visible page.
   const visiblePages = [currentPage];
-  if (viewCount > 1) visiblePages.push(currentPage + 1);
+  if (viewCount > 1) {
+    const right = contentPages[contentIndexForPage(currentPage) + 1];
+    if (right) visiblePages.push(right);
+  }
   const target = visiblePages.includes(lastFocusedPage) ? lastFocusedPage : currentPage;
 
   const key = songKeyForPage(target);
@@ -3136,11 +3395,14 @@ window.addEventListener('resize', () => {
 window.addEventListener('resize', () => {
   if (!pdfDoc) return;
 
-  // While a text note is being edited, a 'resize' is almost always the soft
-  // keyboard opening/closing (height-only). Re-laying out would rebuild the
-  // page DOM and destroy the open editor (dismissing the keyboard). A genuine
-  // rotation/resize changes the WIDTH — only then do we relayout mid-edit.
-  if (textEditor && window.innerWidth === lastLayoutWidth) return;
+  // On mobile the window now uses adjustResize, so the soft keyboard opening or
+  // closing shrinks/grows the window HEIGHT. That must NOT trigger a relayout:
+  // it would re-fit and re-rasterize every page (expensive) and, mid text-edit,
+  // rebuild the DOM and dismiss the keyboard. Only a WIDTH change is a genuine
+  // rotation/resize worth relaying out for. On desktop there's no soft keyboard,
+  // so any resize (including height-only) still relayouts as before.
+  const heightOnly = window.innerWidth === lastLayoutWidth;
+  if (heightOnly && (MOBILE || textEditor)) return;
 
   lastLayoutWidth = window.innerWidth;
   clearTimeout(resizeTimer);
@@ -3187,12 +3449,37 @@ const libraryCloseBtn = document.getElementById('libraryCloseBtn');
 const libraryAddBtn   = document.getElementById('libraryAddBtn');
 
 function openLibrary() {
+  libraryOverlay.classList.remove('closing');
   libraryOverlay.classList.remove('hidden');
   renderLibrary();
 }
 
 function closeLibrary() {
-  libraryOverlay.classList.add('hidden');
+  // Already hidden or mid-close? Do nothing (avoids stacking timers).
+  if (libraryOverlay.classList.contains('hidden') ||
+      libraryOverlay.classList.contains('closing')) return;
+
+  // Play the closing animation (mirror of the open slide-in), then hide.
+  libraryOverlay.classList.add('closing');
+
+  const finish = () => {
+    libraryOverlay.classList.remove('closing');
+    libraryOverlay.classList.add('hidden');
+  };
+
+  const panel = libraryOverlay.querySelector('.library-panel');
+  let done = false;
+  const onEnd = (e) => {
+    if (e && e.target !== panel) return;   // ignore inner animations
+    if (done) return;
+    done = true;
+    clearTimeout(fallback);
+    if (panel) panel.removeEventListener('animationend', onEnd);
+    finish();
+  };
+  if (panel) panel.addEventListener('animationend', onEnd);
+  // Fallback in case animationend doesn't fire (e.g. reduced-motion, no panel).
+  const fallback = setTimeout(onEnd, 300);
 }
 
 libraryCloseBtn.addEventListener('click', closeLibrary);
@@ -3209,12 +3496,7 @@ libraryAddBtn.addEventListener('click', () => {
   openPdfDialog();
 });
 
-// Escape closes the library.
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !libraryOverlay.classList.contains('hidden')) {
-    closeLibrary();
-  }
-});
+// (Escape/back closing the library is handled centrally by handleBack().)
 
 // Render the cover grid from the recent-books list.
 async function renderLibrary() {
@@ -4110,7 +4392,8 @@ function closeConflictReview() {
 mcZoomClose.addEventListener('click', closeConflictReview);
 document.addEventListener('keydown', (e) => {
   if (mcZoomOverlay.classList.contains('hidden')) return;
-  if (e.key === 'Escape') { closeConflictReview(); return; }
+  // Escape/back is handled centrally by handleBack(); here we only own the
+  // in-reviewer navigation keys.
   if (!mcZoom) return;
   const pg = mcZoom.pages[mcZoom.index];
 
@@ -4321,14 +4604,7 @@ manageMarkupsDialog.addEventListener('click', (e) => {
   if (e.target === manageMarkupsDialog) closeManageMarkupsDialog();
 });
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !manageMarkupsDialog.classList.contains('hidden')) {
-    closeManageMarkupsDialog();
-  }
-  if (e.key === 'Escape' && !mergeConflictDialog.classList.contains('hidden')) {
-    closeMergeConflictResolver();
-  }
-});
+// (Escape/back closing these dialogs is handled centrally by handleBack().)
 mergeConflictDialog.addEventListener('click', (e) => {
   if (e.target === mergeConflictDialog) closeMergeConflictResolver();
 });
@@ -4422,3 +4698,114 @@ mmClearConfirmYes.addEventListener('click', async () => {
   }
   showShareToast('All markups cleared.');
 });
+
+// ---------------------------------------------------------------------------
+// Centralized back / Escape navigation
+// ---------------------------------------------------------------------------
+// One ordered handler owns "go back" for both the desktop Escape key and the
+// Android hardware/gesture back button. It closes exactly ONE layer per press,
+// walking the overlay stack from topmost to bottommost. This replaces the old
+// scattered, independent Escape listeners (which could close several layers at
+// once when they were stacked, e.g. the full-screen reviewer sitting on top of
+// the merge dialog).
+//
+// Priority (topmost first):
+//   1. Full-screen merge comparison (mcZoomOverlay)  -> back to merge dialog
+//   2. "Choose which markups to keep" (mergeConflictDialog) -> back to library-era view
+//   3. Manage markups dialog (with its clear-confirm sub-step)
+//   4. Import-markups prompt
+//   5. Search panel
+//   6. Color popover
+//   7. Library overlay  -> reveals the open songbook (or welcome screen)
+//   8. Nothing open: on mobile, double-back exits the app; otherwise no-op.
+//
+// Returns true if a layer was handled (so the caller can preventDefault, and
+// the mobile bridge knows the press was consumed).
+let lastBackAt = 0;              // timestamp of the previous "exit-level" back
+const EXIT_BACK_WINDOW_MS = 2000; // press back twice within this window to exit
+
+function handleBack() {
+  // 1. Full-screen merge comparison (FSMC) -> return to the merge dialog.
+  if (mcZoomOverlay && !mcZoomOverlay.classList.contains('hidden')) {
+    closeConflictReview();
+    return true;
+  }
+
+  // 2. "Choose which markups to keep" dialog -> acts like its Cancel button.
+  if (mergeConflictDialog && !mergeConflictDialog.classList.contains('hidden')) {
+    closeMergeConflictResolver();
+    return true;
+  }
+
+  // 3. Manage markups dialog. If its inline "delete all" confirmation is
+  //    showing, back just cancels that sub-step first; otherwise close it.
+  if (manageMarkupsDialog && !manageMarkupsDialog.classList.contains('hidden')) {
+    if (mmClearConfirm && !mmClearConfirm.classList.contains('hidden')) {
+      mmClearConfirm.classList.add('hidden');
+      mmClearBtn.disabled = false;
+      return true;
+    }
+    closeManageMarkupsDialog();
+    return true;
+  }
+
+  // 4. Import-markups prompt.
+  if (importPrompt && !importPrompt.classList.contains('hidden')) {
+    hideImportPrompt();
+    return true;
+  }
+
+  // 5. Search panel.
+  if (searchPanel && !searchPanel.classList.contains('hidden')) {
+    closeSearch();
+    return true;
+  }
+
+  // 6. Color popover.
+  if (colorPopover && !colorPopover.classList.contains('hidden')) {
+    hideColorPopover();
+    return true;
+  }
+
+  // 7. Library overlay -> closing it reveals whatever is underneath (the open
+  //    songbook, or the welcome screen if no book is open).
+  if (libraryOverlay && !libraryOverlay.classList.contains('hidden')) {
+    closeLibrary();
+    return true;
+  }
+
+  // 8. Nothing to dismiss. On the desktop there's no further "back", so the
+  //    Escape key does nothing here. On mobile we're at the home screen
+  //    (songbook view or welcome): require two quick back presses to exit so a
+  //    stray press can't drop the user out of the app.
+  if (MOBILE) {
+    const now = Date.now();
+    if (now - lastBackAt < EXIT_BACK_WINDOW_MS) {
+      if (window.api && window.api.exitApp) window.api.exitApp();
+      return true;
+    }
+    lastBackAt = now;
+    showShareToast('Press back again to exit');
+    return true;
+  }
+
+  return false;
+}
+
+// Desktop: route the Escape key through the shared handler. Runs in the capture
+// phase so it takes priority and can stop the older per-feature listeners from
+// also reacting to the same press. Escapes that originate inside a focused text
+// field (the note editor / search box) are left to those elements' own scoped
+// handlers, which stopPropagation.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (handleBack()) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+
+// Mobile: drive the same handler from the Android hardware/gesture back button.
+if (MOBILE && window.api && window.api.onBackButton) {
+  window.api.onBackButton(() => { handleBack(); });
+}

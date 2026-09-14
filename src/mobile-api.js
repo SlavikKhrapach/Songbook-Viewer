@@ -5,6 +5,7 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Preferences } from '@capacitor/preferences';
 import { KeepAwake } from '@capacitor-community/keep-awake';
 import { Share } from '@capacitor/share';
+import { App } from '@capacitor/app';
 
 if (!window.api) {
   const DIR       = Directory.Data;
@@ -112,6 +113,8 @@ if (!window.api) {
   // ── File pickers ──────────────────────────────────────────────────────────
 
   let pdfOpenedCallback = null;
+  let backButtonCallback = null;
+  let backButtonRegistered = false;
 
   async function importAndOpen(name, arrayBuffer) {
     const slug        = slugFromName(name);
@@ -191,6 +194,26 @@ if (!window.api) {
     onPdfOpened(callback) {
       pdfOpenedCallback = callback;
       reopenLastBook();
+    },
+
+    // Register the shared renderer's back-navigation handler for the Android
+    // hardware/gesture back button. The renderer decides what "back" means
+    // (close the topmost overlay, close the book, or exit the app); here we
+    // just forward the event to it. We register with the native App plugin
+    // once and delegate every press to the latest callback.
+    onBackButton(callback) {
+      backButtonCallback = callback;
+      if (!backButtonRegistered) {
+        backButtonRegistered = true;
+        App.addListener('backButton', () => {
+          if (backButtonCallback) backButtonCallback();
+        });
+      }
+    },
+
+    // Close the Android app (used for the double-back-to-exit on home).
+    exitApp() {
+      App.exitApp().catch(() => {});
     },
 
     rememberFile() { },

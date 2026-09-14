@@ -1,6 +1,6 @@
 {
   "name": "songbook-viewer",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "A fast, Apple Books-style songbook and PDF viewer for Windows",
   "main": "main.js",
   "scripts": {
@@ -20,6 +20,7 @@
   "dependencies": {
     "@capacitor-community/keep-awake": "^5.0.1",
     "@capacitor/android": "^6.2.1",
+    "@capacitor/app": "^6.0.0",
     "@capacitor/cli": "^6.2.1",
     "@capacitor/core": "^6.2.1",
     "@capacitor/filesystem": "^6.0.4",
